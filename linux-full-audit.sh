@@ -49,7 +49,11 @@ QUICK_MODE=false
 NO_NVD=false
 NO_BROWSER=false
 FORCE=false
+DEEP_SCAN=false
 CUSTOM_OUT=""
+NVD_API_KEY="${NVD_API_KEY:-}"
+COMPARE_FILE=""
+FAIL_ON=""
 
 usage() {
 cat <<'EOF'
@@ -69,27 +73,30 @@ cat <<'EOF'
     -q, --quick           Modo rápido — salta linPEAS e Lynis
     -n, --no-nvd          Salta consulta NVD (modo offline)
     --no-browser          Não abre relatório no browser
+    --deep-scan           Activa Trivy secret+misconfig (mais lento)
     --force               Re-download de ferramentas mesmo que existam
+    --nvd-api-key KEY     NVD API key (também via env var NVD_API_KEY)
+                          Com key: rate limit passa de 5/30s para 50/30s (10× mais rápido)
+                          Obter em: https://nvd.nist.gov/developers/request-an-api-key
+    --compare FILE        Comparar com cve_results.json de run anterior
+                          Output: novos CVEs, resolvidos, mudanças de severidade
+    --fail-on LEVEL       Exit code != 0 quando há findings (para CI/CD)
+                          Valores: critical, high, medium
+                          Codes: 0=clean, 1=erro, 2=critical, 3=high, 4=medium
 
-  DISTRIBUIÇÕES SUPORTADAS:
-    Debian/Ubuntu/Kali (apt) · RHEL/CentOS/Fedora (dnf/yum)
-    Arch/Manjaro (pacman) · openSUSE (zypper) · Alpine (apk)
-
-  ESTRUTURA DE OUTPUT:
-    <script_dir>/
-    ├── linux-full-audit.sh
-    ├── tools/                    ← ferramentas persistem entre runs
-    └── reports/<host>_<date>/
-        ├── 01_sysinfo.txt … 11_app_vulns.txt
-        ├── inventory.json        ← inventário estruturado de packages
-        ├── cve_results.json      ← CVEs com CVSS, CWE, FixedIn
-        ├── app_updates.json      ← updates disponíveis + comandos
-        └── REPORT_<host>_<date>.html  ← relatório unificado
+  EXIT CODES (sem --fail-on, sai sempre 0 excepto em erros):
+    0  Sucesso, sem findings críticos
+    1  Erro de execução (ficheiros, paths, etc)
+    2  --fail-on critical com Critical CVEs encontrados
+    3  --fail-on high com High CVEs encontrados
+    4  --fail-on medium com Medium CVEs encontrados
 
   EXEMPLOS:
     sudo bash linux-full-audit.sh
     sudo bash linux-full-audit.sh --quick --no-nvd
-    sudo bash linux-full-audit.sh --force
+    sudo bash linux-full-audit.sh --nvd-api-key abc123  # 10x mais rápido
+    sudo bash linux-full-audit.sh --compare reports/host_20260515_1030/cve_results.json
+    sudo bash linux-full-audit.sh --fail-on critical    # para CI/CD
     sudo bash linux-full-audit.sh -o /tmp/audit --no-browser
 
 EOF
@@ -104,10 +111,26 @@ while [[ $# -gt 0 ]]; do
         -q|--quick)         QUICK_MODE=true; shift ;;
         -n|--no-nvd)        NO_NVD=true; shift ;;
         --no-browser)       NO_BROWSER=true; shift ;;
+        --deep-scan)        DEEP_SCAN=true; shift ;;
         --force)            FORCE=true; shift ;;
+        --nvd-api-key)      NVD_API_KEY="$2"; shift 2 ;;
+        --compare)          COMPARE_FILE="$2"; shift 2 ;;
+        --fail-on)          FAIL_ON="$2"; shift 2 ;;
         *)                  warn "Opção desconhecida: $1"; shift ;;
     esac
 done
+
+# Validar --fail-on
+if [[ -n "$FAIL_ON" ]] && [[ ! "$FAIL_ON" =~ ^(critical|high|medium)$ ]]; then
+    err "--fail-on deve ser: critical, high, ou medium"
+    exit 1
+fi
+
+# Validar --compare
+if [[ -n "$COMPARE_FILE" ]] && [[ ! -f "$COMPARE_FILE" ]]; then
+    err "--compare: ficheiro não encontrado: $COMPARE_FILE"
+    exit 1
+fi
 
 # ═══════════════════════════════════════════════════════════════════
 # CONFIGURAÇÃO DE PATHS
@@ -131,8 +154,18 @@ OS_UPD_JSON="${OUT}/os_updates.json"
 TRIVY_JSON="${OUT}/trivy_raw.json"
 GRYPE_JSON="${OUT}/11_grype.json"
 LES2_OUT="${OUT}/les2_raw.txt"
+# Exports adicionais (#1 — CSV/SARIF)
+CVE_CSV="${OUT}/cve_results.csv"
+CVE_SARIF="${OUT}/cve_results.sarif"
+DIFF_FILE="${OUT}/diff_vs_previous.json"
 
 mkdir -p "$OUT" "$TOOLS"
+
+# Cache global de Trivy e Grype DBs — persiste entre runs (#4)
+# Poupa ~600MB de download por run
+export TRIVY_CACHE_DIR="${TOOLS}/trivy-cache"
+export GRYPE_DB_CACHE_DIR="${TOOLS}/grype-cache"
+mkdir -p "$TRIVY_CACHE_DIR" "$GRYPE_DB_CACHE_DIR"
 
 # ─── Root check ───────────────────────────────────────────────────
 IS_ROOT=0; [[ "$(id -u)" -eq 0 ]] && IS_ROOT=1
@@ -229,15 +262,60 @@ install_pkg() {
 
 html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 
+# NVD API helper com retry em 429 + suporte para API key (#2)
+# Sem key: rate limit 5/30s — esperar 32s entre batches de 5
+# Com key: rate limit 50/30s — esperar 6s entre batches de 50
+# Uso: nvd_curl "keyword" [results_per_page]
+nvd_curl() {
+    local kw="$1" rpp="${2:-5}"
+    local url="https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${kw}&resultsPerPage=${rpp}"
+    local attempt
+    local -a curl_args
+    curl_args=(-fsSL --max-time 25 --write-out '\nHTTPCODE:%{http_code}')
+    # Adicionar API key header se disponível
+    if [[ -n "$NVD_API_KEY" ]]; then
+        curl_args+=(-H "apiKey: $NVD_API_KEY")
+    fi
+    for attempt in 1 2; do
+        local http_code body
+        body=$(curl "${curl_args[@]}" "$url" 2>/dev/null) || return 1
+        http_code=$(echo "$body" | tail -1 | grep -oE 'HTTPCODE:[0-9]+' | cut -d: -f2)
+        body=$(echo "$body" | sed '$d')
+        if [[ "$http_code" == "200" ]]; then
+            echo "$body"
+            return 0
+        fi
+        if [[ "$http_code" == "429" && "$attempt" -eq 1 ]]; then
+            sleep 32
+            continue
+        fi
+        return 1
+    done
+    return 1
+}
+
+# Sleep entre requests NVD ajustado pela presença de API key
+nvd_sleep_short() {
+    # Entre requests individuais
+    if [[ -n "$NVD_API_KEY" ]]; then sleep 1; else sleep 7; fi
+}
+nvd_sleep_batch() {
+    # Após N requests, esperar quota de 30s
+    if [[ -n "$NVD_API_KEY" ]]; then sleep 6; else sleep 32; fi
+}
+
 colorize() {
+    # IMPORTANTE: aplicar CVE/CWE PRIMEIRO (tags inline curtas).
+    # Depois aplicar tags de linha inteira — non-greedy ($) para não engolir múltiplas linhas.
+    # Sem .* no início porque sed já trabalha por linha.
     sed \
-        -e 's/\(.*CRÍTICO.*\)/<span class="finding-line">\1<\/span>/g' \
-        -e 's/\(.*CRITICAL.*\)/<span class="finding-line">\1<\/span>/g' \
-        -e 's/\(.*ALERTA.*\)/<span class="alert-line">\1<\/span>/g' \
-        -e 's/\(.*\[HIGH\].*\)/<span class="alert-line">\1<\/span>/g' \
-        -e 's/\(.*OK:.*\)/<span class="ok-line">\1<\/span>/g' \
         -e 's/\(CVE-[0-9]\{4\}-[0-9]\+\)/<span class="cve-inline">\1<\/span>/g' \
-        -e 's/\(CWE-[0-9]\+\)/<span class="cwe-inline">\1<\/span>/g'
+        -e 's/\(CWE-[0-9]\+\)/<span class="cwe-inline">\1<\/span>/g' \
+        -e 's/^\(.*CRÍTICO.*\)$/<span class="finding-line">\1<\/span>/' \
+        -e 's/^\(.*CRITICAL.*\)$/<span class="finding-line">\1<\/span>/' \
+        -e 's/^\(.*ALERTA.*\)$/<span class="alert-line">\1<\/span>/' \
+        -e 's/^\(.*\[HIGH\].*\)$/<span class="alert-line">\1<\/span>/' \
+        -e 's/^\(.*OK:.*\)$/<span class="ok-line">\1<\/span>/'
 }
 
 categorize() {
@@ -294,34 +372,78 @@ fi
 HAS_LYNIS=false
 LYNIS_BIN="lynis"
 if command -v lynis &>/dev/null; then
-    HAS_LYNIS=true; info "Lynis — sistema OK ($(lynis --version 2>/dev/null | head -1))"
-elif [[ -f "${TOOLS}/lynis/lynis" ]]; then
-    HAS_LYNIS=true; LYNIS_BIN="${TOOLS}/lynis/lynis"; info "Lynis — cache OK"
+    HAS_LYNIS=true
+    info "Lynis — sistema OK ($(lynis --version 2>/dev/null | head -1))"
+elif [[ -f "${TOOLS}/lynis/lynis" ]] && [[ "$FORCE" == "false" ]]; then
+    HAS_LYNIS=true
+    LYNIS_BIN="${TOOLS}/lynis/lynis"
+    info "Lynis — cache OK"
 elif [[ "$SKIP_DOWNLOAD" == "false" ]] || [[ "$FORCE" == "true" ]]; then
     info "A descarregar Lynis..."
+    # Tentar API GitHub para versão mais recente (CISOfy/lynis); fallback hardcoded
+    LYNIS_VER=$(curl -fsSL "https://api.github.com/repos/CISOfy/lynis/releases/latest" 2>/dev/null \
+                | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))" \
+                2>/dev/null || echo "3.1.4")
     LYNIS_TAR="${TOOLS}/lynis.tar.gz"
-    safe_download "https://downloads.cisofy.com/lynis/lynis-3.1.1.tar.gz" "$LYNIS_TAR" 100000 && \
-        tar -xzf "$LYNIS_TAR" -C "$TOOLS" 2>/dev/null && \
-        [[ -f "${TOOLS}/lynis/lynis" ]] && \
-        { HAS_LYNIS=true; LYNIS_BIN="${TOOLS}/lynis/lynis"; info "  Lynis OK"; } || \
-        warn "  Lynis — download falhou"
+    LYNIS_URL="https://github.com/CISOfy/lynis/archive/refs/tags/${LYNIS_VER}.tar.gz"
+    if safe_download "$LYNIS_URL" "$LYNIS_TAR" 100000; then
+        # GitHub archive cria lynis-<ver>/, normalizar para lynis/
+        tar -xzf "$LYNIS_TAR" -C "$TOOLS" 2>/dev/null
+        if [[ -d "${TOOLS}/lynis-${LYNIS_VER}" ]]; then
+            rm -rf "${TOOLS}/lynis"
+            mv "${TOOLS}/lynis-${LYNIS_VER}" "${TOOLS}/lynis"
+        fi
+        if [[ -f "${TOOLS}/lynis/lynis" ]]; then
+            chmod +x "${TOOLS}/lynis/lynis"
+            HAS_LYNIS=true
+            LYNIS_BIN="${TOOLS}/lynis/lynis"
+            info "  Lynis v${LYNIS_VER} OK"
+        else
+            warn "  Lynis — extracção falhou"
+        fi
+    else
+        # Fallback: CISOfy download server (versão hardcoded)
+        if safe_download "https://downloads.cisofy.com/lynis/lynis-3.1.1.tar.gz" "$LYNIS_TAR" 100000; then
+            tar -xzf "$LYNIS_TAR" -C "$TOOLS" 2>/dev/null
+            if [[ -f "${TOOLS}/lynis/lynis" ]]; then
+                HAS_LYNIS=true
+                LYNIS_BIN="${TOOLS}/lynis/lynis"
+                info "  Lynis 3.1.1 (fallback) OK"
+            fi
+        else
+            warn "  Lynis — download falhou"
+        fi
+    fi
+    rm -f "$LYNIS_TAR"
 fi
 
 # ── Trivy ─────────────────────────────────────────────────────────
 TRIVY_BIN="${TOOLS}/trivy"
 if command -v trivy &>/dev/null && [[ "$FORCE" == "false" ]]; then
-    TRIVY_BIN="trivy"; info "Trivy — sistema OK"
+    TRIVY_BIN="trivy"
+    info "Trivy — sistema OK"
 elif [[ ! -f "$TRIVY_BIN" ]] || [[ "$FORCE" == "true" ]]; then
     info "A determinar versão do Trivy..."
-    TRIVY_VER=$(curl -fsSL "https://api.github.com/repos/aquasecurity/trivy/releases/latest" \
-                2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))" \
+    TRIVY_VER=$(curl -fsSL "https://api.github.com/repos/aquasecurity/trivy/releases/latest" 2>/dev/null \
+                | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))" \
                 2>/dev/null || echo "0.51.0")
-    case "$ARCH" in x86_64) TA="Linux-64bit";; aarch64) TA="Linux-ARM64";; *) TA="Linux-64bit";; esac
+    case "$ARCH" in
+        x86_64)  TA="Linux-64bit" ;;
+        aarch64) TA="Linux-ARM64" ;;
+        *)       TA="Linux-64bit" ;;
+    esac
     TRIVY_URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VER}/trivy_${TRIVY_VER}_${TA}.tar.gz"
     TRIVY_TAR="${TOOLS}/trivy.tar.gz"
-    safe_download "$TRIVY_URL" "$TRIVY_TAR" 5000000 && \
-        tar -xzf "$TRIVY_TAR" -C "$TOOLS" trivy 2>/dev/null && \
-        chmod +x "$TRIVY_BIN" && info "  Trivy v${TRIVY_VER} OK" || warn "  Trivy — download falhou"
+    if safe_download "$TRIVY_URL" "$TRIVY_TAR" 5000000; then
+        if tar -xzf "$TRIVY_TAR" -C "$TOOLS" trivy 2>/dev/null && [[ -f "$TRIVY_BIN" ]]; then
+            chmod +x "$TRIVY_BIN"
+            info "  Trivy v${TRIVY_VER} OK"
+        else
+            warn "  Trivy — extracção falhou"
+        fi
+    else
+        warn "  Trivy — download falhou"
+    fi
     rm -f "$TRIVY_TAR"
 else
     sz=$(stat -c%s "$TRIVY_BIN" 2>/dev/null || echo 0)
@@ -332,15 +454,27 @@ fi
 GRYPE_BIN="${TOOLS}/grype"
 if [[ ! -f "$GRYPE_BIN" ]] || [[ "$FORCE" == "true" ]]; then
     info "A determinar versão do Grype..."
-    GRYPE_VER=$(curl -fsSL "https://api.github.com/repos/anchore/grype/releases/latest" \
-                2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))" \
+    GRYPE_VER=$(curl -fsSL "https://api.github.com/repos/anchore/grype/releases/latest" 2>/dev/null \
+                | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))" \
                 2>/dev/null || echo "0.78.0")
-    case "$ARCH" in x86_64) GA="linux_amd64";; aarch64) GA="linux_arm64";; armv7*) GA="linux_arm";; *) GA="linux_amd64";; esac
+    case "$ARCH" in
+        x86_64)  GA="linux_amd64" ;;
+        aarch64) GA="linux_arm64" ;;
+        armv7*)  GA="linux_arm" ;;
+        *)       GA="linux_amd64" ;;
+    esac
     GRYPE_URL="https://github.com/anchore/grype/releases/download/v${GRYPE_VER}/grype_${GRYPE_VER}_${GA}.tar.gz"
     GRYPE_TAR="${TOOLS}/grype.tar.gz"
-    safe_download "$GRYPE_URL" "$GRYPE_TAR" 20000000 && \
-        tar -xzf "$GRYPE_TAR" -C "$TOOLS" grype 2>/dev/null && \
-        chmod +x "$GRYPE_BIN" && info "  Grype v${GRYPE_VER} OK" || warn "  Grype — download falhou"
+    if safe_download "$GRYPE_URL" "$GRYPE_TAR" 20000000; then
+        if tar -xzf "$GRYPE_TAR" -C "$TOOLS" grype 2>/dev/null && [[ -f "$GRYPE_BIN" ]]; then
+            chmod +x "$GRYPE_BIN"
+            info "  Grype v${GRYPE_VER} OK"
+        else
+            warn "  Grype — extracção falhou"
+        fi
+    else
+        warn "  Grype — download falhou"
+    fi
     rm -f "$GRYPE_TAR"
 else
     sz=$(stat -c%s "$GRYPE_BIN" 2>/dev/null || echo 0)
@@ -364,12 +498,18 @@ fi
 # ── linux-exploit-suggester-2 ─────────────────────────────────────
 LES2="${TOOLS}/les2.pl"
 LES_SH="${TOOLS}/linux-exploit-suggester.sh"
-[[ ! -f "$LES2" ]] || [[ "$FORCE" == "true" ]] && \
+if [[ ! -f "$LES2" ]] || [[ "$FORCE" == "true" ]]; then
     ensure_tool "linux-exploit-suggester-2" "$LES2" \
         "https://raw.githubusercontent.com/jondonas/linux-exploit-suggester-2/master/linux-exploit-suggester-2.pl" 2000
-[[ ! -f "$LES_SH" ]] || [[ "$FORCE" == "true" ]] && \
+else
+    info "linux-exploit-suggester-2 — cache OK"
+fi
+if [[ ! -f "$LES_SH" ]] || [[ "$FORCE" == "true" ]]; then
     ensure_tool "linux-exploit-suggester" "$LES_SH" \
         "https://raw.githubusercontent.com/The-Z-Labs/linux-exploit-suggester/master/linux-exploit-suggester.sh" 5000
+else
+    info "linux-exploit-suggester — cache OK"
+fi
 
 # ═══════════════════════════════════════════════════════════════════
 # FASE 2 — SCANS DE SEGURANÇA (herdados do linux-audit.sh)
@@ -469,9 +609,15 @@ fi
 section "05 — Trivy CVE Scan"
 if [[ -x "$TRIVY_BIN" ]] || command -v trivy &>/dev/null; then
     TRIVY_CMD=$(command -v trivy 2>/dev/null || echo "$TRIVY_BIN")
-    info "A correr Trivy (texto)..."
+    if [[ "$DEEP_SCAN" == "true" ]]; then
+        SCANNERS="vuln,secret,misconfig"
+        info "A correr Trivy (texto, deep scan: $SCANNERS)..."
+    else
+        SCANNERS="vuln"
+        info "A correr Trivy (texto, scanners: $SCANNERS)..."
+    fi
     timeout 600 "$TRIVY_CMD" fs / \
-        --scanners vuln,secret,misconfig \
+        --scanners "$SCANNERS" \
         --severity CRITICAL,HIGH,MEDIUM \
         --format table --no-progress --timeout 10m \
         --skip-dirs /proc,/sys,/dev,/run,/snap \
@@ -500,9 +646,8 @@ else
         for pkg in "${!PKGS_TO_CHECK[@]}"; do
             ver="${PKGS_TO_CHECK[$pkg]}"; [[ -z "$ver" ]] && continue
             echo "─── ${pkg} ${ver} ───"
-            NVD_RESP=$(curl -fsSL --max-time 15 \
-                "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${pkg}&resultsPerPage=5" 2>/dev/null) || \
-                { echo "  Falha API NVD"; sleep 7; continue; }
+            NVD_RESP=$(nvd_curl "$pkg" 5) || \
+                { echo "  Falha API NVD"; nvd_sleep_short; continue; }
             echo "$NVD_RESP" | python3 -c "
 import sys,json
 try:
@@ -514,10 +659,11 @@ try:
             if ms: sev=ms[0].get('cvssData',{}).get('baseSeverity','N/A'); break
         desc=next((x['value'] for x in v['cve'].get('descriptions',[]) if x.get('lang')=='en'),'')[:120]
         cwes=[d2['value'] for w in v['cve'].get('weaknesses',[]) for d2 in w.get('description',[]) if d2.get('value','').startswith('CWE-')]
-        print(f'  {cve} [{sev}] CWE:{chr(34).join(cwes) or \"N/A\"} — {desc}')
+        cwes_str = ', '.join(cwes) if cwes else 'N/A'
+        print(f'  {cve} [{sev}] CWE: {cwes_str} — {desc}')
 except Exception as e: print(f'  Erro: {e}')
 " 2>/dev/null
-            echo ""; sleep 7
+            echo ""; nvd_sleep_short
         done
     } > "${OUT}/06_nvd_cve.txt" 2>&1; info "06_nvd_cve OK"
 fi
@@ -763,7 +909,9 @@ if [[ -x "$OSV_BIN" ]]; then
         timeout 180 "$OSV_BIN" --format table --fs / 2>/dev/null || echo "  OSV --installed não suportado"
     echo ""
     echo "--- Lock files ---"
-    LOCK_FILES=$(find / \( -name "package-lock.json" -o -name "yarn.lock" -o -name "requirements.txt" \
+    # -xdev: não atravessar mountpoints (NFS, FUSE, etc — podem travar)
+    # timeout 60s: limite total para o find não levar minutos
+    LOCK_FILES=$(timeout 60 find / -xdev \( -name "package-lock.json" -o -name "yarn.lock" -o -name "requirements.txt" \
         -o -name "Pipfile.lock" -o -name "poetry.lock" -o -name "Gemfile.lock" \
         -o -name "go.sum" -o -name "Cargo.lock" -o -name "pom.xml" \) \
         -not -path "*/\.*" -not -path "*/node_modules/*" -not -path "/proc/*" -not -path "/sys/*" \
@@ -790,7 +938,7 @@ if [[ -x "$GRYPE_BIN" ]]; then
     timeout 300 "$GRYPE_BIN" --output json dir:/ \
         --exclude "/proc" --exclude "/sys" --exclude "/dev" --exclude "/run" \
         --file "$GRYPE_JSON" 2>/dev/null || true
-    [[ -f "$GRYPE_JSON" ]] && python3 - <<'PYEOF'
+    [[ -f "$GRYPE_JSON" ]] && GRYPE_JSON="$GRYPE_JSON" python3 - <<'PYEOF'
 import json,os,sys
 gf=os.environ.get('GRYPE_JSON','')
 try:
@@ -827,9 +975,8 @@ if [[ "$NO_NVD" != "true" ]]; then
     for app in "${!PURL_MAP[@]}"; do
         ver="${PURL_MAP[$app]}"; [[ -z "$ver" ]] && continue
         echo "─── ${app} ${ver} ───"
-        NVD_RESP=$(curl -fsSL --max-time 15 \
-            "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${app}&resultsPerPage=5" 2>/dev/null) || \
-            { echo "  API NVD indisponível"; sleep 7; continue; }
+        NVD_RESP=$(nvd_curl "$app" 5) || \
+            { echo "  API NVD indisponível"; nvd_sleep_short; continue; }
         echo "$NVD_RESP" | python3 -c "
 import sys,json
 try:
@@ -844,7 +991,7 @@ try:
         print(f'  {label}: {cve} [{sev}] — {desc}')
 except Exception as e: print(f'  Erro: {e}')
 " 2>/dev/null
-        echo ""; sleep 7
+        echo ""; nvd_sleep_short
     done
 fi
 
@@ -993,14 +1140,16 @@ fi
 [[ -f "$GRYPE_JSON" ]] && info "Grype JSON já disponível (fase 11)"
 
 # Construir cve_results.json a partir de Trivy + Grype + NVD
-python3 - <<PYEOF > "$CVE_FILE" 2>/dev/null
+TRIVY_JSON="$TRIVY_JSON" GRYPE_JSON="$GRYPE_JSON" INV_FILE="$INV_FILE" NO_NVD="$NO_NVD" \
+NVD_API_KEY="$NVD_API_KEY" \
+python3 - <<'PYEOF' > "$CVE_FILE" 2>/dev/null
 import json, urllib.request, urllib.parse, time, sys, os
 
 results = []
 seen_pairs = set()
 
 # ── Trivy ────────────────────────────────────────────────────────
-trivy_file = "${TRIVY_JSON}"
+trivy_file = os.environ.get('TRIVY_JSON','')
 if os.path.exists(trivy_file):
     try:
         td = json.load(open(trivy_file))
@@ -1029,7 +1178,7 @@ if os.path.exists(trivy_file):
         print(f'[!]   Trivy JSON erro: {e}', file=sys.stderr)
 
 # ── Grype ────────────────────────────────────────────────────────
-grype_file = "${GRYPE_JSON}"
+grype_file = os.environ.get('GRYPE_JSON','')
 grype_added = 0
 if os.path.exists(grype_file):
     try:
@@ -1057,25 +1206,54 @@ if os.path.exists(grype_file):
         print(f'[!]   Grype JSON erro: {e}', file=sys.stderr)
 
 # ── NVD API (apps conhecidas) ────────────────────────────────────
-no_nvd = "${NO_NVD}"
+no_nvd = os.environ.get('NO_NVD','false')
+inv_file = os.environ.get('INV_FILE','')
+nvd_api_key = os.environ.get('NVD_API_KEY','')
+
+# Rate limits — com API key são 10× maiores
+if nvd_api_key:
+    batch_size = 50    # 50 req per 30s window
+    batch_sleep = 6    # seconds entre batches
+    max_apps = 100     # mais apps possível com key
+else:
+    batch_size = 5     # 5 req per 30s window
+    batch_sleep = 32   # 32s entre batches
+    max_apps = 30      # limitar para não demorar uma hora
+
 if no_nvd != "true":
     try:
-        inv_data = json.load(open("${INV_FILE}"))
+        inv_data = json.load(open(inv_file))
     except: inv_data = []
-    bin_apps = [x for x in inv_data if x.get('source') == 'binary' and x.get('nvd_keyword')][:30]
-    print(f'[+] NVD API: {len(bin_apps)} apps...', file=sys.stderr)
-    for i, app in enumerate(bin_apps):
-        if i > 0 and i % 5 == 0:
-            print('[+]   NVD: rate limit pause...', file=sys.stderr)
-            time.sleep(32)
-        kw  = urllib.parse.quote(app.get('nvd_keyword',''))
+    bin_apps = [x for x in inv_data if x.get('source') == 'binary' and x.get('nvd_keyword')][:max_apps]
+    print(f'[+] NVD API: {len(bin_apps)} apps (API key: {"sim" if nvd_api_key else "não"})...', file=sys.stderr)
+
+    def nvd_fetch(keyword, retries=1):
+        kw = urllib.parse.quote(keyword)
         url = f'https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={kw}&resultsPerPage=10'
+        for attempt in range(retries + 1):
+            try:
+                headers = {'User-Agent': 'linux-full-audit/1.0'}
+                if nvd_api_key:
+                    headers['apiKey'] = nvd_api_key
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=25) as r:
+                    return json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < retries:
+                    print(f'[!]   NVD 429 — retry em {batch_sleep}s...', file=sys.stderr)
+                    time.sleep(batch_sleep); continue
+                raise
+        return None
+
+    for i, app in enumerate(bin_apps):
+        if i > 0 and i % batch_size == 0:
+            print(f'[+]   NVD: rate limit pause ({batch_sleep}s)...', file=sys.stderr)
+            time.sleep(batch_sleep)
         try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'linux-full-audit/1.0'})
-            with urllib.request.urlopen(req, timeout=25) as r:
-                data = json.loads(r.read())
+            data = nvd_fetch(app.get('nvd_keyword',''), retries=1)
         except Exception as e:
             print(f'[!]   NVD [{app["key"]}]: {e}', file=sys.stderr); continue
+        if not data: continue
         for v in data.get('vulnerabilities', []):
             cve = v['cve']; cve_id = cve['id']
             pair = (cve_id, app['key'])
@@ -1108,22 +1286,182 @@ CVE_TOTAL=$(python3 -c "import json; print(len(json.load(open('${CVE_FILE}'))))"
 info "CVEs: ${CVE_TOTAL} total → ${CVE_FILE}"
 
 # ═══════════════════════════════════════════════════════════════════
+# FASE 4.5 — EXPORTS (CSV + SARIF) e COMPARAÇÃO (#1 + #3)
+# ═══════════════════════════════════════════════════════════════════
+step "FASE 4.5 — Exports CSV/SARIF + Compare"
+
+# ── CSV Export ────────────────────────────────────────────────────
+CVE_FILE="$CVE_FILE" CSV_FILE="$CVE_CSV" python3 <<'PYEOF' 2>/dev/null
+import json, csv, os
+try:
+    data = json.load(open(os.environ['CVE_FILE']))
+except Exception as e:
+    print(f'[!] CSV: erro a ler CVE file: {e}')
+    exit(0)
+with open(os.environ['CSV_FILE'], 'w', newline='', encoding='utf-8') as f:
+    fields = ['Source','App','Version','FixedIn','CveId','Severity','Cvss','Cwe','Title','Description','References']
+    w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+    w.writeheader()
+    for row in data: w.writerow(row)
+print(f'[+] CSV: {len(data)} CVEs exportados')
+PYEOF
+[[ -f "$CVE_CSV" ]] && info "CSV export: $CVE_CSV"
+
+# ── SARIF Export ──────────────────────────────────────────────────
+# SARIF 2.1.0 — formato standard consumido por GitHub, Azure DevOps, GitLab
+CVE_FILE="$CVE_FILE" SARIF_FILE="$CVE_SARIF" TARGET="$TARGET" python3 <<'PYEOF' 2>/dev/null
+import json, os, datetime
+try:
+    data = json.load(open(os.environ['CVE_FILE']))
+except Exception as e:
+    print(f'[!] SARIF: erro: {e}'); exit(0)
+
+sev_map = {'CRITICAL': 'error', 'HIGH': 'error', 'IMPORTANT': 'error',
+           'MEDIUM': 'warning', 'MODERATE': 'warning',
+           'LOW': 'note', 'NEGLIGIBLE': 'note', 'UNKNOWN': 'none'}
+
+# Construir rules únicas e results
+rules_dict = {}
+results = []
+for cve in data:
+    cve_id = cve.get('CveId','')
+    if not cve_id: continue
+    if cve_id not in rules_dict:
+        rules_dict[cve_id] = {
+            "id": cve_id,
+            "name": cve_id,
+            "shortDescription": {"text": (cve.get('Title') or cve_id)[:120]},
+            "fullDescription": {"text": (cve.get('Description') or '')[:500] or cve_id},
+            "helpUri": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+            "properties": {
+                "tags": ["security", "cve", cve.get('Cwe','').split(',')[0].strip() if cve.get('Cwe') else ''],
+                "security-severity": str(cve.get('Cvss') or 0)
+            }
+        }
+    sev = (cve.get('Severity') or 'UNKNOWN').upper()
+    results.append({
+        "ruleId": cve_id,
+        "level": sev_map.get(sev, 'none'),
+        "message": {
+            "text": f"{cve.get('App','?')} {cve.get('Version','?')} → {cve_id} ({sev})" +
+                    (f" — fixed in {cve['FixedIn']}" if cve.get('FixedIn') else "")
+        },
+        "locations": [{
+            "physicalLocation": {
+                "artifactLocation": {"uri": cve.get('App','unknown')}
+            }
+        }],
+        "properties": {
+            "package": cve.get('App',''),
+            "version": cve.get('Version',''),
+            "fixedVersion": cve.get('FixedIn',''),
+            "cwe": cve.get('Cwe',''),
+            "source": cve.get('Source','')
+        }
+    })
+
+sarif = {
+    "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+    "version": "2.1.0",
+    "runs": [{
+        "tool": {
+            "driver": {
+                "name": "linux-full-audit",
+                "version": "1.0",
+                "informationUri": "https://github.com/user/security-audit-scripts",
+                "rules": list(rules_dict.values())
+            }
+        },
+        "invocations": [{
+            "executionSuccessful": True,
+            "startTimeUtc": datetime.datetime.utcnow().isoformat() + 'Z',
+            "machine": os.environ.get('TARGET','')
+        }],
+        "results": results
+    }]
+}
+with open(os.environ['SARIF_FILE'], 'w', encoding='utf-8') as f:
+    json.dump(sarif, f, indent=2)
+print(f'[+] SARIF: {len(results)} results, {len(rules_dict)} rules')
+PYEOF
+[[ -f "$CVE_SARIF" ]] && info "SARIF export: $CVE_SARIF"
+
+# ── Compare com run anterior (#3) ─────────────────────────────────
+if [[ -n "$COMPARE_FILE" ]]; then
+    info "A comparar com: $COMPARE_FILE"
+    CVE_FILE="$CVE_FILE" PREV_FILE="$COMPARE_FILE" DIFF_FILE="$DIFF_FILE" python3 <<'PYEOF' 2>/dev/null
+import json, os
+try:
+    current = json.load(open(os.environ['CVE_FILE']))
+    previous = json.load(open(os.environ['PREV_FILE']))
+except Exception as e:
+    print(f'[!] Compare: erro: {e}'); exit(0)
+
+# Indexar por (CVE, App) para comparar
+def index_by_key(data):
+    return { (x.get('CveId',''), x.get('App','')): x for x in data if x.get('CveId') }
+
+cur_idx = index_by_key(current)
+prev_idx = index_by_key(previous)
+cur_keys = set(cur_idx.keys())
+prev_keys = set(prev_idx.keys())
+
+new_cves      = [cur_idx[k] for k in (cur_keys - prev_keys)]
+resolved_cves = [prev_idx[k] for k in (prev_keys - cur_keys)]
+
+# Mudanças de severidade
+sev_changes = []
+for k in (cur_keys & prev_keys):
+    cur_sev = (cur_idx[k].get('Severity') or '').upper()
+    prev_sev = (prev_idx[k].get('Severity') or '').upper()
+    if cur_sev != prev_sev:
+        sev_changes.append({
+            "CveId": k[0], "App": k[1],
+            "Previous": prev_sev, "Current": cur_sev,
+            "Cvss": cur_idx[k].get('Cvss')
+        })
+
+diff = {
+    "previous_file": os.environ['PREV_FILE'],
+    "current_file": os.environ['CVE_FILE'],
+    "summary": {
+        "total_previous": len(previous),
+        "total_current": len(current),
+        "new": len(new_cves),
+        "resolved": len(resolved_cves),
+        "severity_changed": len(sev_changes)
+    },
+    "new_cves": new_cves,
+    "resolved_cves": resolved_cves,
+    "severity_changes": sev_changes
+}
+with open(os.environ['DIFF_FILE'], 'w', encoding='utf-8') as f:
+    json.dump(diff, f, indent=2)
+
+print(f'[+] Compare: {len(new_cves)} novos, {len(resolved_cves)} resolvidos, {len(sev_changes)} mudaram severidade')
+PYEOF
+    [[ -f "$DIFF_FILE" ]] && info "Diff: $DIFF_FILE"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # FASE 5 — APP UPDATES JSON
 # ═══════════════════════════════════════════════════════════════════
 step "FASE 5 — App Updates"
 
-python3 - <<PYEOF > "$APP_UPD_JSON" 2>/dev/null
+PKG_MGR="$PKG_MGR" SUDO="$SUDO" python3 - <<'PYEOF' > "$APP_UPD_JSON" 2>/dev/null
 import json, subprocess, re, sys, os
 
 updates = []
-pkg_mgr = "${PKG_MGR}"
+pkg_mgr = os.environ.get('PKG_MGR','unknown')
+sudo    = os.environ.get('SUDO','')
 
 def run(cmd, timeout=90):
     try: return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, timeout=timeout, text=True)
     except: return ""
 
 if pkg_mgr == "apt":
-    run("apt-get update -qq 2>/dev/null")
+    # Update cache — apt-get update precisa de root; usar SUDO se script não está como root
+    run(f"{sudo} apt-get update -qq 2>/dev/null")
     out = run("apt list --upgradable 2>/dev/null")
     for line in out.splitlines():
         m = re.match(r'^(\S+)/\S+\s+(\S+)\s+\S+\s+\[upgradable from:\s+(\S+)\]', line)
@@ -1132,7 +1470,7 @@ if pkg_mgr == "apt":
                             "UpdateCmd":f"apt-get install --only-upgrade {m.group(1)}"})
 
 elif pkg_mgr in ("dnf","yum"):
-    out = run(f"{pkg_mgr} check-update --quiet 2>/dev/null")
+    out = run(f"{sudo} {pkg_mgr} check-update --quiet 2>/dev/null")
     for line in out.splitlines():
         m = re.match(r'^(\S+)\s+(\S+)\s+(\S+)', line)
         if m and m.group(1) not in ('Last','Loaded','Updated','Security'):
@@ -1179,11 +1517,19 @@ sleep 1  # flush a disco
 
 # ── Estatísticas para o relatório de audit ─────────────────────────
 mapfile -t TXT_FILES < <(find "$OUT" -maxdepth 1 -name "*.txt" -type f | sort)
+
+# Cache: contagens crit/high por ficheiro — calculado UMA vez, reusado em TOC,
+# Executive Summary, secções por categoria e categoria-level totals
+declare -A CRIT_CACHE HIGH_CACHE
 TOTAL_CRIT=0; TOTAL_HIGH=0; ALL_CVES=""; ALL_CWES=""
 for f in "${TXT_FILES[@]}"; do
-    [[ -f "$f" && -s "$f" ]] || continue
-    c=$(safe_count "$f" "CRÍTICO\|CRITICAL"); h=$(safe_count "$f" "\[HIGH\]\|HIGH\b\|ALERTA")
-    TOTAL_CRIT=$(( TOTAL_CRIT + c )); TOTAL_HIGH=$(( TOTAL_HIGH + h ))
+    [[ -f "$f" && -s "$f" ]] || { CRIT_CACHE[$f]=0; HIGH_CACHE[$f]=0; continue; }
+    c=$(safe_count "$f" "CRÍTICO\|CRITICAL")
+    h=$(safe_count "$f" "\[HIGH\]\|HIGH\b\|ALERTA")
+    CRIT_CACHE[$f]=$c
+    HIGH_CACHE[$f]=$h
+    TOTAL_CRIT=$(( TOTAL_CRIT + c ))
+    TOTAL_HIGH=$(( TOTAL_HIGH + h ))
     cves_found=$(grep -oE "CVE-[0-9]{4}-[0-9]+" "$f" 2>/dev/null | sort -u | tr '\n' ' ') || true
     cwes_found=$(grep -oE "CWE-[0-9]+"            "$f" 2>/dev/null | sort -u | tr '\n' ' ') || true
     ALL_CVES="${ALL_CVES} ${cves_found}"; ALL_CWES="${ALL_CWES} ${cwes_found}"
@@ -1209,25 +1555,51 @@ TOP_FINDINGS=$(
 )
 
 build_cve_table() {
+    # Para cada CVE: procurar em todos os .txt, tentar encontrar severity dentro de 80 chars
+    # do CVE (à direita ou à esquerda) — heurística melhor do que apenas "context"
     for cve in $CVES_SORTED; do
         [[ -z "$cve" ]] && continue
-        local sev="UNKNOWN" desc="" found_in=""
+        local sev="UNKNOWN" desc="" found_in="" sev_prefix="5"
         for f in "${TXT_FILES[@]}"; do
             [[ -s "$f" ]] || continue
-            ctx=$(grep -B1 -A2 -m1 "$cve" "$f" 2>/dev/null | tr '\n' ' ' | tr -s ' ')
-            if [[ -n "$ctx" ]]; then
+            # Procurar o CVE no ficheiro
+            if grep -q "$cve" "$f" 2>/dev/null; then
                 found_in=$(basename "$f" .txt)
-                echo "$ctx" | grep -qE "\bCRITICAL\b" && sev="CRITICAL"
-                echo "$ctx" | grep -qE "\bHIGH\b"     && sev="HIGH"
-                echo "$ctx" | grep -qE "\bMEDIUM\b"   && sev="MEDIUM"
-                echo "$ctx" | grep -qE "\bLOW\b"      && sev="LOW"
+                # Pegar a linha do CVE + 1 antes e 1 depois
+                local raw_ctx
+                raw_ctx=$(grep -B1 -A1 -m1 "$cve" "$f" 2>/dev/null)
+                # Procurar severity próximo do CVE (mesma linha tem prioridade)
+                local cve_line
+                cve_line=$(echo "$raw_ctx" | grep -m1 "$cve")
+                # Prioridade: severity NA MESMA LINHA do CVE
+                if echo "$cve_line" | grep -qE "\bCRITICAL\b|CRÍTICO"; then
+                    sev="CRITICAL"; sev_prefix="1"
+                elif echo "$cve_line" | grep -qE "\bHIGH\b|ALERTA"; then
+                    sev="HIGH"; sev_prefix="2"
+                elif echo "$cve_line" | grep -qE "\bMEDIUM\b"; then
+                    sev="MEDIUM"; sev_prefix="3"
+                elif echo "$cve_line" | grep -qE "\bLOW\b"; then
+                    sev="LOW"; sev_prefix="4"
+                else
+                    # Fallback: severity nas linhas adjacentes (mesma ordem)
+                    if echo "$raw_ctx" | grep -qE "\bCRITICAL\b|CRÍTICO"; then
+                        sev="CRITICAL"; sev_prefix="1"
+                    elif echo "$raw_ctx" | grep -qE "\bHIGH\b|ALERTA"; then
+                        sev="HIGH"; sev_prefix="2"
+                    elif echo "$raw_ctx" | grep -qE "\bMEDIUM\b"; then
+                        sev="MEDIUM"; sev_prefix="3"
+                    elif echo "$raw_ctx" | grep -qE "\bLOW\b"; then
+                        sev="LOW"; sev_prefix="4"
+                    fi
+                fi
                 desc=$(grep -A1 "$cve" "$f" 2>/dev/null | grep -oE "Desc: .{0,150}" | head -1 | sed 's/^Desc: //' | html_escape)
                 [[ -z "$desc" ]] && desc="(ver ${found_in})"
                 break
             fi
         done
-        echo "${sev}|${cve}|${found_in}|${desc}"
-    done | sort -t'|' -k1,1
+        # Prefixo numérico para ordenação semântica (1=CRITICAL ... 5=UNKNOWN)
+        echo "${sev_prefix}|${sev}|${cve}|${found_in}|${desc}"
+    done | sort -t'|' -k1,1n -k3,3 | cut -d'|' -f2-
 }
 CVE_TABLE_DATA=$(build_cve_table)
 
@@ -1433,7 +1805,7 @@ for cat in $TOC_ORDER; do
     label=$(category_label "$cat"); echo "<div class=\"toc-cat\">${label}</div>"
     for base in $files; do
         f="${OUT}/${base}.txt"; [[ -f "$f" ]] || continue
-        fc=$(safe_count "$f" "CRÍTICO\|CRITICAL"); fh=$(safe_count "$f" "\[HIGH\]\|HIGH\b\|ALERTA")
+        fc="${CRIT_CACHE[$f]:-0}"; fh="${HIGH_CACHE[$f]:-0}"
         badges=""
         [[ "$fc" -gt 0 ]] 2>/dev/null && badges="${badges}<span class=\"toc-mini tm-c\">${fc}</span>"
         [[ "$fh" -gt 0 ]] 2>/dev/null && badges="${badges}<span class=\"toc-mini tm-h\">${fh}</span>"
@@ -1529,8 +1901,8 @@ for cat in $TOC_ORDER; do
     cat_crit=0; cat_high=0
     for base in $files; do
         f="${OUT}/${base}.txt"; [[ -f "$f" ]] || continue
-        cat_crit=$(( cat_crit + $(safe_count "$f" "CRÍTICO\|CRITICAL") ))
-        cat_high=$(( cat_high + $(safe_count "$f" "\[HIGH\]\|HIGH\b\|ALERTA") ))
+        cat_crit=$(( cat_crit + ${CRIT_CACHE[$f]:-0} ))
+        cat_high=$(( cat_high + ${HIGH_CACHE[$f]:-0} ))
     done
     cat_cls="category"
     [[ "$cat_crit" -gt 0 ]] 2>/dev/null && cat_cls="${cat_cls} has-crit"
@@ -1538,7 +1910,7 @@ for cat in $TOC_ORDER; do
     echo "<div class=\"${cat_cls}\"><div class=\"category-h\">${label}</div>"
     for base in $files; do
         f="${OUT}/${base}.txt"; [[ -f "$f" ]] || continue
-        fc=$(safe_count "$f" "CRÍTICO\|CRITICAL"); fh=$(safe_count "$f" "\[HIGH\]\|HIGH\b\|ALERTA")
+        fc="${CRIT_CACHE[$f]:-0}"; fh="${HIGH_CACHE[$f]:-0}"
         badges=""
         [[ "$fc" -gt 0 ]] 2>/dev/null && badges="${badges}<span class=\"badge b-crit\">${fc} CRITICAL</span>"
         [[ "$fh" -gt 0 ]] 2>/dev/null && badges="${badges}<span class=\"badge b-high\">${fh} HIGH</span>"
@@ -1546,10 +1918,11 @@ for cat in $TOC_ORDER; do
         sec_cls="sec"; auto_open=""
         [[ "$fc" -gt 0 ]] 2>/dev/null && { sec_cls="${sec_cls} has-crit"; auto_open=" open"; }
         [[ "$fh" -gt 0 ]] 2>/dev/null && { sec_cls="${sec_cls} has-high"; [[ -z "$auto_open" ]] && auto_open=" open"; }
-        content=$(head -3000 "$f" | html_escape | colorize)
+        # LC_ALL=C para tratar bytes literais (linPEAS pode ter chars não-UTF8)
+        content=$(LC_ALL=C head -3000 "$f" | html_escape | colorize)
         sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
         [[ "${sz//[[:space:]]/}" -gt 500000 ]] 2>/dev/null && content="${content}
-<span style='color:var(--yellow)'>[... truncado — ver ficheiro completo ...]</span>"
+<span style='color:var(--yellow)'>[... truncado a 3000 linhas — ver ficheiro completo ...]</span>"
         echo "<div class=\"${sec_cls}\" id=\"${base}\"><div class=\"sec-h\" onclick=\"toggle('${base}')\">"
         echo "<span class=\"sec-t\">&#128196; ${base}</span><span>${badges}</span></div>"
         echo "<div class=\"sec-c${auto_open}\" id=\"${base}-content\"><pre>${content}</pre></div></div>"
@@ -1774,9 +2147,19 @@ cat <<EOF
 ║  [Dash]   App upd   : ${APP_UPD_COUNT}
 ║  Inventário         : ${INV_COUNT} items
 ╠══════════════════════════════════════════════════╣
-║  Relatório : ${REPORT}
-╚══════════════════════════════════════════════════╝
+║  Relatório HTML : ${REPORT}
+║  Inventory JSON : ${INV_FILE}
+║  CVEs JSON      : ${CVE_FILE}
+║  CVEs CSV       : ${CVE_CSV}
+║  CVEs SARIF     : ${CVE_SARIF}
 EOF
+if [[ -f "$DIFF_FILE" ]]; then
+    NEW_C=$(python3 -c "import json; print(json.load(open('$DIFF_FILE'))['summary']['new'])" 2>/dev/null || echo "?")
+    RES_C=$(python3 -c "import json; print(json.load(open('$DIFF_FILE'))['summary']['resolved'])" 2>/dev/null || echo "?")
+    echo "║  Diff vs prev   : +${NEW_C} novos, -${RES_C} resolvidos"
+    echo "║                   ${DIFF_FILE}"
+fi
+echo "╚══════════════════════════════════════════════════╝"
 printf '\033[0m\n'
 
 if [[ "$NO_BROWSER" == "false" ]] && [[ -f "$REPORT" ]]; then
@@ -1786,3 +2169,39 @@ if [[ "$NO_BROWSER" == "false" ]] && [[ -f "$REPORT" ]]; then
         firefox "$REPORT" &>/dev/null &
     fi
 fi
+
+# ═══════════════════════════════════════════════════════════════════
+# EXIT CODE SEMÂNTICO (#5)
+# ═══════════════════════════════════════════════════════════════════
+EXIT_CODE=0
+if [[ -n "$FAIL_ON" ]]; then
+    case "$FAIL_ON" in
+        critical)
+            if [[ "$CVE_CRIT" -gt 0 ]] 2>/dev/null || [[ "$TOTAL_CRIT" -gt 0 ]] 2>/dev/null; then
+                err "FAIL-ON CRITICAL: ${CVE_CRIT} CVEs Critical (JSON), ${TOTAL_CRIT} findings Critical (audit)"
+                EXIT_CODE=2
+            fi
+            ;;
+        high)
+            if [[ "$CVE_CRIT" -gt 0 ]] 2>/dev/null || [[ "$TOTAL_CRIT" -gt 0 ]] 2>/dev/null; then
+                err "FAIL-ON HIGH: ${CVE_CRIT} Critical detectados"
+                EXIT_CODE=2
+            elif [[ "$CVE_HIGH" -gt 0 ]] 2>/dev/null || [[ "$TOTAL_HIGH" -gt 0 ]] 2>/dev/null; then
+                err "FAIL-ON HIGH: ${CVE_HIGH} CVEs High (JSON), ${TOTAL_HIGH} findings High (audit)"
+                EXIT_CODE=3
+            fi
+            ;;
+        medium)
+            if [[ "$CVE_CRIT" -gt 0 ]] 2>/dev/null; then
+                err "FAIL-ON MEDIUM: ${CVE_CRIT} Critical detectados"; EXIT_CODE=2
+            elif [[ "$CVE_HIGH" -gt 0 ]] 2>/dev/null; then
+                err "FAIL-ON MEDIUM: ${CVE_HIGH} High detectados"; EXIT_CODE=3
+            elif [[ "$CVE_MED" -gt 0 ]] 2>/dev/null; then
+                err "FAIL-ON MEDIUM: ${CVE_MED} CVEs Medium"
+                EXIT_CODE=4
+            fi
+            ;;
+    esac
+fi
+
+exit $EXIT_CODE

@@ -40,7 +40,11 @@ param(
     [switch]$NoBrowser,
     [switch]$AvExclusion,
     [switch]$DeepScan,
-    [switch]$Force
+    [switch]$Force,
+    [string]$NvdApiKey = $env:NVD_API_KEY,
+    [string]$Compare   = "",
+    [ValidateSet("","critical","high","medium")]
+    [string]$FailOn    = ""
 )
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -74,11 +78,21 @@ if ($Help) {
     -AvExclusion        Adiciona Tools\ às exclusões do Defender durante o scan
     -DeepScan           Activa Trivy secret+misconfig (mais lento, encontra secrets)
     -Force              Re-download de ferramentas mesmo que existam
+    -NvdApiKey KEY      NVD API key (tambem via env var NVD_API_KEY)
+                        Com key: rate limit 5/30s -> 50/30s (10x mais rapido)
+                        Obter em: https://nvd.nist.gov/developers/request-an-api-key
+    -Compare FILE       Comparar com cve_results.json de run anterior
+    -FailOn LEVEL       Exit code != 0 quando ha findings (CI/CD)
+                        Valores: critical, high, medium
+                        Codes: 0=clean, 1=erro, 2=critical, 3=high, 4=medium
 
   EXEMPLOS:
     powershell -ExecutionPolicy Bypass -File windows-full-audit.ps1
     powershell -ExecutionPolicy Bypass -File windows-full-audit.ps1 -Quick -NoNvd
     powershell -ExecutionPolicy Bypass -File windows-full-audit.ps1 -AvExclusion
+    powershell -ExecutionPolicy Bypass -File windows-full-audit.ps1 -NvdApiKey "abc123"
+    powershell -ExecutionPolicy Bypass -File windows-full-audit.ps1 -Compare "reports\host_20260515_1030\cve_results.json"
+    powershell -ExecutionPolicy Bypass -File windows-full-audit.ps1 -FailOn critical
     powershell -ExecutionPolicy Bypass -File windows-full-audit.ps1 -Force
 "@ -ForegroundColor Cyan
     exit 0
@@ -104,8 +118,24 @@ $CveFile     = "$Out\cve_results.json"
 $AppUpdFile  = "$Out\app_updates.json"
 $TrivyJson   = "$Out\trivy_raw.json"
 $GrypeJson   = "$Out\12_grype.json"
+# Exports adicionais (#1) e diff (#3)
+$CveCsv      = "$Out\cve_results.csv"
+$CveSarif    = "$Out\cve_results.sarif"
+$DiffFile    = "$Out\diff_vs_previous.json"
 
 New-Item -ItemType Directory -Force -Path $Out, $Tools | Out-Null
+
+# Cache global Trivy/Grype DBs — persiste entre runs (#4)
+# Poupa ~600MB de download por run
+$env:TRIVY_CACHE_DIR    = "$Tools\trivy-cache"
+$env:GRYPE_DB_CACHE_DIR = "$Tools\grype-cache"
+New-Item -ItemType Directory -Force -Path $env:TRIVY_CACHE_DIR, $env:GRYPE_DB_CACHE_DIR | Out-Null
+
+# Validar -Compare
+if ($Compare -ne "" -and -not (Test-Path $Compare)) {
+    Write-Err "-Compare: ficheiro não encontrado: $Compare"
+    exit 1
+}
 
 # ─── Admin + contadores ───────────────────────────────────────────
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
@@ -233,9 +263,18 @@ function Invoke-NvdApi {
     param([string]$Keyword, [int]$ResultsPerPage = 10, [int]$Retries = 1)
     $kw  = [Uri]::EscapeUriString($Keyword)
     $url = "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${kw}&resultsPerPage=${ResultsPerPage}"
+    # Headers: incluir API key se disponivel (#2 — 10x rate limit)
+    $headers = @{}
+    if ($script:NvdApiKey -and $script:NvdApiKey -ne "") {
+        $headers["apiKey"] = $script:NvdApiKey
+    }
     for ($attempt = 0; $attempt -le $Retries; $attempt++) {
         try {
-            return Invoke-RestMethod -Uri $url -TimeoutSec 25 -ErrorAction Stop
+            if ($headers.Count -gt 0) {
+                return Invoke-RestMethod -Uri $url -TimeoutSec 25 -Headers $headers -ErrorAction Stop
+            } else {
+                return Invoke-RestMethod -Uri $url -TimeoutSec 25 -ErrorAction Stop
+            }
         } catch {
             $statusCode = 0
             try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
@@ -247,6 +286,16 @@ function Invoke-NvdApi {
             throw
         }
     }
+}
+
+# Sleep entre requests NVD — ajustado pela presença de API key
+function Get-NvdSleep {
+    if ($script:NvdApiKey -and $script:NvdApiKey -ne "") { return 1 }
+    else { return 7 }
+}
+function Get-NvdBatchSleep {
+    if ($script:NvdApiKey -and $script:NvdApiKey -ne "") { return 6 }
+    else { return 32 }
 }
 
 function Get-Category {
@@ -576,7 +625,7 @@ if ($NoNvd) {
                 $nvdOut.Add("  $cveId [$sev] CWE: $cwes"); $nvdOut.Add("  Desc: $desc"); $nvdOut.Add("")
             }
         } catch { $nvdOut.Add("  NVD API erro: $($_.Exception.Message)") }
-        $nvdOut.Add(""); Start-Sleep -Seconds 7
+        $nvdOut.Add(""); Start-Sleep -Seconds (Get-NvdSleep)
     }
     $nvdOut | Out-File "$Out\08_nvd_cve.txt" -Encoding UTF8; Write-Info "08_nvd_cve OK"
 }
@@ -877,7 +926,7 @@ if ($NoNvd) { $appOutput.Add("[saltado — -NoNvd activo]") } else {
                 $appOutput.Add("  ${label}: ${cveId} [$sev] — ${desc}")
             }
         } catch { $appOutput.Add("  NVD erro: $($_.Exception.Message)") }
-        $appOutput.Add(""); Start-Sleep -Seconds 7
+        $appOutput.Add(""); Start-Sleep -Seconds (Get-NvdSleep)
     }
 }
 
@@ -1034,12 +1083,18 @@ if ((Test-Path $GrypeJson) -and (Get-Item $GrypeJson).Length -gt 0) {
 
 # NVD API para apps conhecidas
 if (-not $NoNvd) {
-    Write-Info "NVD API para $($Inventory.Count) apps conhecidas..."
-    Write-Info "  (Rate limit: 5 req/30s — pode demorar)"
+    $hasApiKey = ($NvdApiKey -ne "")
+    $batchSize = if ($hasApiKey) { 50 } else { 5 }
+    $maxApps   = if ($hasApiKey) { 100 } else { 30 }
+    Write-Info "NVD API para $($Inventory.Count) apps (API key: $hasApiKey)..."
+    Write-Info "  Rate limit: $batchSize req per 30s — esperar $(Get-NvdBatchSleep)s entre batches"
     $reqCount = 0
-    foreach ($app in $Inventory) {
+    foreach ($app in ($Inventory | Select-Object -First $maxApps)) {
         $reqCount++
-        if ($reqCount -gt 1 -and ($reqCount % 5 -eq 1)) { Write-Info "  Rate limit pause..."; Start-Sleep -Seconds 32 }
+        if ($reqCount -gt 1 -and ($reqCount % $batchSize -eq 1)) {
+            Write-Info "  Rate limit pause ($(Get-NvdBatchSleep)s)..."
+            Start-Sleep -Seconds (Get-NvdBatchSleep)
+        }
         try {
             $resp = Invoke-NvdApi -Keyword $app.NvdKeyword -ResultsPerPage 10 -Retries 1
             foreach ($v in $resp.vulnerabilities) {
@@ -1062,6 +1117,126 @@ if (-not $NoNvd) {
 
 $CveResults | ConvertTo-Json -Depth 5 | Out-File $CveFile -Encoding UTF8
 Write-Info "CVEs: $($CveResults.Count) total → $CveFile"
+
+# ═══════════════════════════════════════════════════════════════════
+# FASE 4.5 — EXPORTS (CSV + SARIF) e COMPARAÇÃO (#1 + #3)
+# ═══════════════════════════════════════════════════════════════════
+Write-Step "FASE 4.5 — Exports CSV/SARIF + Compare"
+
+# ── CSV Export ────────────────────────────────────────────────────
+try {
+    $CveResults |
+        Select-Object Source,App,Version,FixedIn,CveId,Severity,Cvss,Cwe,Title,Description,References |
+        Export-Csv -Path $CveCsv -NoTypeInformation -Encoding UTF8 -Force
+    Write-Info "CSV: $($CveResults.Count) CVEs → $CveCsv"
+} catch { Write-Warn "CSV export: $($_.Exception.Message)" }
+
+# ── SARIF Export ──────────────────────────────────────────────────
+# SARIF 2.1.0 — formato standard consumido por GitHub, Azure DevOps, GitLab
+try {
+    $sevMap = @{ "CRITICAL"="error"; "HIGH"="error"; "IMPORTANT"="error"; "MEDIUM"="warning"; "MODERATE"="warning"; "LOW"="note"; "NEGLIGIBLE"="note"; "UNKNOWN"="none" }
+    $rulesDict = @{}
+    $sarifResults = [System.Collections.Generic.List[object]]::new()
+    foreach ($cve in $CveResults) {
+        if (-not $cve.CveId) { continue }
+        if (-not $rulesDict.ContainsKey($cve.CveId)) {
+            $rulesDict[$cve.CveId] = @{
+                id    = $cve.CveId
+                name  = $cve.CveId
+                shortDescription = @{ text = if ($cve.Title) { $cve.Title.Substring(0,[Math]::Min(120,$cve.Title.Length)) } else { $cve.CveId } }
+                fullDescription  = @{ text = if ($cve.Description) { $cve.Description.Substring(0,[Math]::Min(500,$cve.Description.Length)) } else { $cve.CveId } }
+                helpUri = "https://nvd.nist.gov/vuln/detail/$($cve.CveId)"
+                properties = @{
+                    tags = @("security","cve")
+                    "security-severity" = if ($cve.Cvss) { [string]$cve.Cvss } else { "0" }
+                }
+            }
+        }
+        $sev = if ($cve.Severity) { $cve.Severity.ToUpper() } else { "UNKNOWN" }
+        $level = if ($sevMap.ContainsKey($sev)) { $sevMap[$sev] } else { "none" }
+        $msg = "$($cve.App) $($cve.Version) → $($cve.CveId) ($sev)"
+        if ($cve.FixedIn) { $msg += " — fixed in $($cve.FixedIn)" }
+        $sarifResults.Add(@{
+            ruleId  = $cve.CveId
+            level   = $level
+            message = @{ text = $msg }
+            locations = @(@{ physicalLocation = @{ artifactLocation = @{ uri = if ($cve.App) { $cve.App } else { "unknown" } } } })
+            properties = @{
+                package      = if ($cve.App) { $cve.App } else { "" }
+                version      = if ($cve.Version) { $cve.Version } else { "" }
+                fixedVersion = if ($cve.FixedIn) { $cve.FixedIn } else { "" }
+                cwe          = if ($cve.Cwe) { $cve.Cwe } else { "" }
+                source       = if ($cve.Source) { $cve.Source } else { "" }
+            }
+        })
+    }
+    $sarif = @{
+        '$schema' = "https://json.schemastore.org/sarif-2.1.0.json"
+        version   = "2.1.0"
+        runs      = @(@{
+            tool = @{
+                driver = @{
+                    name    = "windows-full-audit"
+                    version = "1.0"
+                    informationUri = "https://github.com/user/security-audit-scripts"
+                    rules = @($rulesDict.Values)
+                }
+            }
+            invocations = @(@{
+                executionSuccessful = $true
+                startTimeUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                machine = $Target
+            })
+            results = $sarifResults
+        })
+    }
+    $sarif | ConvertTo-Json -Depth 20 | Out-File $CveSarif -Encoding UTF8 -Force
+    Write-Info "SARIF: $($sarifResults.Count) results, $($rulesDict.Count) rules → $CveSarif"
+} catch { Write-Warn "SARIF export: $($_.Exception.Message)" }
+
+# ── Compare com run anterior (#3) ─────────────────────────────────
+if ($Compare -ne "") {
+    Write-Info "A comparar com: $Compare"
+    try {
+        $previous = Get-Content $Compare -Raw | ConvertFrom-Json
+        # Indexar por (CveId, App) — chaves como hashtables (HashSet em PS é mais chato)
+        $curIdx = @{}; foreach ($c in $CveResults) { if ($c.CveId) { $curIdx["$($c.CveId)|$($c.App)"] = $c } }
+        $prevIdx = @{}; foreach ($c in $previous) { if ($c.CveId) { $prevIdx["$($c.CveId)|$($c.App)"] = $c } }
+
+        $newCves    = @($curIdx.Keys  | Where-Object { -not $prevIdx.ContainsKey($_) } | ForEach-Object { $curIdx[$_] })
+        $resolved   = @($prevIdx.Keys | Where-Object { -not $curIdx.ContainsKey($_) } | ForEach-Object { $prevIdx[$_] })
+        $sevChanges = [System.Collections.Generic.List[object]]::new()
+        foreach ($k in ($curIdx.Keys | Where-Object { $prevIdx.ContainsKey($_) })) {
+            $curSev  = if ($curIdx[$k].Severity)  { $curIdx[$k].Severity.ToUpper() }  else { "" }
+            $prevSev = if ($prevIdx[$k].Severity) { $prevIdx[$k].Severity.ToUpper() } else { "" }
+            if ($curSev -ne $prevSev) {
+                $sevChanges.Add([PSCustomObject]@{
+                    CveId    = $curIdx[$k].CveId
+                    App      = $curIdx[$k].App
+                    Previous = $prevSev
+                    Current  = $curSev
+                    Cvss     = $curIdx[$k].Cvss
+                })
+            }
+        }
+        $diff = [PSCustomObject]@{
+            previous_file = $Compare
+            current_file  = $CveFile
+            summary = @{
+                total_previous   = $previous.Count
+                total_current    = $CveResults.Count
+                new              = $newCves.Count
+                resolved         = $resolved.Count
+                severity_changed = $sevChanges.Count
+            }
+            new_cves         = $newCves
+            resolved_cves    = $resolved
+            severity_changes = $sevChanges
+        }
+        $diff | ConvertTo-Json -Depth 10 | Out-File $DiffFile -Encoding UTF8 -Force
+        Write-Info "Compare: $($newCves.Count) novos, $($resolved.Count) resolvidos, $($sevChanges.Count) mudaram severidade → $DiffFile"
+    } catch { Write-Warn "Compare: $($_.Exception.Message)" }
+}
 
 # ═══════════════════════════════════════════════════════════════════
 # FASE 5 — APP UPDATES JSON (winget + choco + scoop)
@@ -1667,23 +1842,65 @@ if ($AvExclusionAdded) {
 }
 
 # ── Sumário Final ─────────────────────────────────────────────────
-Write-Host @"
-`n╔══════════════════════════════════════════════════╗
-║   AUDIT COMPLETO                                 ║
-╠══════════════════════════════════════════════════╣
-║  [Audit]  Critical  : $TotalCrit
-║  [Audit]  High      : $TotalHigh
-║  [Audit]  CVEs txt  : $UniqCves
-║  [Dash]   CVEs JSON : $($CveResults.Count)
-║  [Dash]   CWEs      : $CweUniq
-║  [Dash]   App upd   : $($AppUpdates.Count)
-║  Inventário         : $($Inventory.Count) apps conhecidas
-╠══════════════════════════════════════════════════╣
-║  Relatório: $Report
-╚══════════════════════════════════════════════════╝
-"@ -ForegroundColor Cyan
+$summaryLines = @(
+    "╔══════════════════════════════════════════════════╗"
+    "║   AUDIT COMPLETO                                 ║"
+    "╠══════════════════════════════════════════════════╣"
+    "║  [Audit]  Critical  : $TotalCrit"
+    "║  [Audit]  High      : $TotalHigh"
+    "║  [Audit]  CVEs txt  : $UniqCves"
+    "║  [Dash]   CVEs JSON : $($CveResults.Count)"
+    "║  [Dash]   CWEs      : $CweUniq"
+    "║  [Dash]   App upd   : $($AppUpdates.Count)"
+    "║  Inventário         : $($Inventory.Count) apps conhecidas"
+    "╠══════════════════════════════════════════════════╣"
+    "║  Relatório HTML : $Report"
+    "║  Inventory JSON : $InvFile"
+    "║  CVEs JSON      : $CveFile"
+    "║  CVEs CSV       : $CveCsv"
+    "║  CVEs SARIF     : $CveSarif"
+)
+if (Test-Path $DiffFile) {
+    try {
+        $diffData = Get-Content $DiffFile -Raw | ConvertFrom-Json
+        $summaryLines += "║  Diff vs prev   : +$($diffData.summary.new) novos, -$($diffData.summary.resolved) resolvidos"
+        $summaryLines += "║                   $DiffFile"
+    } catch {}
+}
+$summaryLines += "╚══════════════════════════════════════════════════╝"
+
+Write-Host "`n$($summaryLines -join "`n")" -ForegroundColor Cyan
 
 if (-not $NoBrowser -and (Test-Path $Report)) {
     Write-Info "A abrir relatório no browser..."
     Start-Process $Report
 }
+
+# ── Exit code semântico (#5) ──────────────────────────────────────
+$exitCode = 0
+if ($FailOn -ne "") {
+    switch ($FailOn) {
+        "critical" {
+            if ($CveCrit -gt 0 -or $TotalCrit -gt 0) {
+                Write-Err "FAIL-ON CRITICAL: $CveCrit CVEs Critical (JSON), $TotalCrit findings Critical (audit)"
+                $exitCode = 2
+            }
+        }
+        "high" {
+            if ($CveCrit -gt 0 -or $TotalCrit -gt 0) {
+                Write-Err "FAIL-ON HIGH: $CveCrit Critical detectados"
+                $exitCode = 2
+            } elseif ($CveHigh -gt 0 -or $TotalHigh -gt 0) {
+                Write-Err "FAIL-ON HIGH: $CveHigh CVEs High (JSON), $TotalHigh findings High (audit)"
+                $exitCode = 3
+            }
+        }
+        "medium" {
+            if ($CveCrit -gt 0) { Write-Err "FAIL-ON MEDIUM: $CveCrit Critical detectados"; $exitCode = 2 }
+            elseif ($CveHigh -gt 0) { Write-Err "FAIL-ON MEDIUM: $CveHigh High detectados"; $exitCode = 3 }
+            elseif ($CveMed -gt 0) { Write-Err "FAIL-ON MEDIUM: $CveMed CVEs Medium"; $exitCode = 4 }
+        }
+    }
+}
+
+exit $exitCode

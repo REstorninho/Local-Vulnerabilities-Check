@@ -39,6 +39,7 @@ param(
     [Alias("n")] [switch]$NoNvd,
     [switch]$NoBrowser,
     [switch]$AvExclusion,
+    [switch]$DeepScan,
     [switch]$Force
 )
 
@@ -71,6 +72,7 @@ if ($Help) {
     -NoNvd (-n)         Salta consulta NVD (modo offline)
     -NoBrowser          Não abre relatório no browser
     -AvExclusion        Adiciona Tools\ às exclusões do Defender durante o scan
+    -DeepScan           Activa Trivy secret+misconfig (mais lento, encontra secrets)
     -Force              Re-download de ferramentas mesmo que existam
 
   EXEMPLOS:
@@ -214,14 +216,37 @@ function Escape-Html {
 
 function Colorize-Html {
     param([string]$s)
-    $s = $s -replace "(.*CRÍTICO.*)",  '<span class="finding-line">$1</span>'
-    $s = $s -replace "(.*CRITICAL.*)", '<span class="finding-line">$1</span>'
-    $s = $s -replace "(.*ALERTA.*)",   '<span class="alert-line">$1</span>'
-    $s = $s -replace "(\[HIGH\].*)",   '<span class="alert-line">$1</span>'
-    $s = $s -replace "(.*\bOK:.*)",    '<span class="ok-line">$1</span>'
-    $s = $s -replace "(CVE-\d{4}-\d+)",'<span class="cve-inline">$1</span>'
-    $s = $s -replace "(CWE-\d+)",      '<span class="cwe-inline">$1</span>'
+    # IMPORTANTE: aplicar CVE/CWE PRIMEIRO (tags inline curtas).
+    # Depois aplicar tags de linha inteira — usar regex non-greedy ($) para não engolir múltiplas linhas.
+    $s = $s -replace "(CVE-\d{4}-\d+)",  '<span class="cve-inline">$1</span>'
+    $s = $s -replace "(CWE-\d+)",        '<span class="cwe-inline">$1</span>'
+    # Linhas inteiras — non-greedy, ancorado a fim de linha
+    $s = $s -replace "(?m)^([^\r\n]*CRÍTICO[^\r\n]*)$",  '<span class="finding-line">$1</span>'
+    $s = $s -replace "(?m)^([^\r\n]*CRITICAL[^\r\n]*)$", '<span class="finding-line">$1</span>'
+    $s = $s -replace "(?m)^([^\r\n]*ALERTA[^\r\n]*)$",   '<span class="alert-line">$1</span>'
+    $s = $s -replace "(?m)^([^\r\n]*\[HIGH\][^\r\n]*)$", '<span class="alert-line">$1</span>'
+    $s = $s -replace "(?m)^([^\r\n]*\bOK:[^\r\n]*)$",    '<span class="ok-line">$1</span>'
     return $s
+}
+
+function Invoke-NvdApi {
+    param([string]$Keyword, [int]$ResultsPerPage = 10, [int]$Retries = 1)
+    $kw  = [Uri]::EscapeUriString($Keyword)
+    $url = "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${kw}&resultsPerPage=${ResultsPerPage}"
+    for ($attempt = 0; $attempt -le $Retries; $attempt++) {
+        try {
+            return Invoke-RestMethod -Uri $url -TimeoutSec 25 -ErrorAction Stop
+        } catch {
+            $statusCode = 0
+            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+            if ($statusCode -eq 429 -and $attempt -lt $Retries) {
+                Write-Warn "  NVD 429 rate limit — retry em 32s..."
+                Start-Sleep -Seconds 32
+                continue
+            }
+            throw
+        }
+    }
 }
 
 function Get-Category {
@@ -371,7 +396,7 @@ Run-Scan "01_sysinfo" "$Out\01_sysinfo.txt" {
     "=== SISTEMA ==="; "Hostname : $env:COMPUTERNAME"; "Domain   : $env:USERDOMAIN"
     "Username : $env:USERNAME"; "OS       : $([System.Environment]::OSVersion.VersionString)"
     ""; "=== SYSTEMINFO ==="; systeminfo 2>&1
-    ""; "=== HOTFIXES INSTALADOS ==="; Get-HotFix | Sort-Object InstalledOn -Descending | Format-Table -AutoSize | Out-String
+    ""; "=== HOTFIXES INSTALADOS ==="; Get-HotFix -ErrorAction SilentlyContinue | Sort-Object @{Expression={ if ($_.InstalledOn) { $_.InstalledOn } else { [datetime]::MinValue } }} -Descending | Format-Table -AutoSize | Out-String
     ""; "=== PROCESSOS A CORRER ==="; Get-Process | Sort-Object CPU -Descending | Format-Table Id,Name,CPU,WorkingSet -AutoSize | Out-String
     ""; "=== DRIVES ==="; Get-PSDrive -PSProvider FileSystem | Format-Table | Out-String
 }
@@ -481,7 +506,7 @@ if (Test-Path $PrivescCheck) {
         Wait-Job $pcJob -Timeout 300 | Out-Null
         $jobOut = Receive-Job $pcJob; Remove-Job $pcJob -Force
         @("=== PRIVESCCHECK OUTPUT ===","Correu como Admin: $runAsAdmin","","NOTA: Quando Admin, checks de ACL são menos fiáveis.","","") + $jobOut |
-            Out-File "$Out\06_privesc_job.txt" -Encoding UTF8
+            Out-File "$Out\06_privesc.txt" -Encoding UTF8
         Write-Info "06_privesc OK"
     } catch {
         "Erro: $($_.Exception.Message)" | Out-File "$Out\06_privesc.txt" -Encoding UTF8
@@ -498,9 +523,10 @@ if (Test-Path $PrivescCheck) {
 # ─── 07: Trivy (texto) ────────────────────────────────────────────
 Write-Sec "07 — Trivy"
 if (Test-Path $TrivyBin) {
-    Write-Info "A correr Trivy (texto)..."
+    $scanners = if ($DeepScan) { "vuln,secret,misconfig" } else { "vuln" }
+    Write-Info "A correr Trivy (texto, scanners: $scanners)..."
     try {
-        & $TrivyBin fs "C:\" --scanners vuln,secret,misconfig --severity CRITICAL,HIGH,MEDIUM `
+        & $TrivyBin fs "C:\" --scanners $scanners --severity CRITICAL,HIGH,MEDIUM `
             --format table --no-progress --timeout 10m `
             --skip-dirs "C:\Windows\WinSxS,C:\Windows\SoftwareDistribution" `
             --output "$Out\07_trivy.txt" 2>&1 | Out-Null
@@ -523,14 +549,24 @@ if ($NoNvd) {
     if ($osInfo2.Version) { $components["windows"] = $osInfo2.Version }
     $iisV = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\InetStp" -ErrorAction SilentlyContinue).VersionString
     if ($iisV) { $components["iis"] = $iisV }
-    $sshV = (Get-ItemProperty "HKLM:\SOFTWARE\OpenSSH" -ErrorAction SilentlyContinue).ProductVersion
-    if ($sshV) { $components["openssh"] = $sshV }
+    # SSH: o OpenSSH do Windows não tem ProductVersion no registry — usar FileVersionInfo do ssh.exe
+    $sshCmd = Get-Command ssh.exe -ErrorAction SilentlyContinue
+    if ($sshCmd) {
+        $sshV = $sshCmd.Version.ToString()
+        if (-not $sshV -or $sshV -eq "0.0.0.0") {
+            # Fallback: parsear output de "ssh -V" (vai para stderr)
+            $sshOut = & ssh.exe -V 2>&1 | Out-String
+            if ($sshOut -match "OpenSSH_for_Windows_(\d+\.\d+[.\dp]*)") { $sshV = $Matches[1] }
+            elseif ($sshOut -match "OpenSSH_(\d+\.\d+[.\dp]*)") { $sshV = $Matches[1] }
+        }
+        if ($sshV) { $components["openssh"] = $sshV }
+    }
     $dnV = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -ErrorAction SilentlyContinue).Version
     if ($dnV) { $components["dotnet"] = $dnV }
     foreach ($pkg in $components.Keys) {
         $ver = $components[$pkg]; $nvdOut.Add("─── $pkg $ver ───")
         try {
-            $resp = Invoke-RestMethod "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${pkg}&resultsPerPage=5" -TimeoutSec 20 -ErrorAction Stop
+            $resp = Invoke-NvdApi -Keyword $pkg -ResultsPerPage 5 -Retries 1
             foreach ($v in $resp.vulnerabilities | Select-Object -First 5) {
                 $cveId = $v.cve.id; $sev = "N/A"
                 foreach ($mk in @("cvssMetricV31","cvssMetricV30","cvssMetricV2")) { $ms = $v.cve.metrics.$mk; if ($ms) { $sev = $ms[0].cvssData.baseSeverity; break } }
@@ -831,7 +867,7 @@ if ($NoNvd) { $appOutput.Add("[saltado — -NoNvd activo]") } else {
     foreach ($app in $purlMap.Keys) {
         $ver = $purlMap[$app]; $appOutput.Add("─── $app $ver ───")
         try {
-            $resp = Invoke-RestMethod "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${app}&resultsPerPage=5" -TimeoutSec 20 -ErrorAction Stop
+            $resp = Invoke-NvdApi -Keyword $app -ResultsPerPage 5 -Retries 1
             foreach ($v in $resp.vulnerabilities | Select-Object -First 5) {
                 $cveId = $v.cve.id; $sev = "N/A"
                 foreach ($mk in @("cvssMetricV31","cvssMetricV30","cvssMetricV2")) { $ms = $v.cve.metrics.$mk; if ($ms) { $sev = $ms[0].cvssData.baseSeverity; break } }
@@ -1005,8 +1041,7 @@ if (-not $NoNvd) {
         $reqCount++
         if ($reqCount -gt 1 -and ($reqCount % 5 -eq 1)) { Write-Info "  Rate limit pause..."; Start-Sleep -Seconds 32 }
         try {
-            $kw   = [Uri]::EscapeUriString($app.NvdKeyword)
-            $resp = Invoke-RestMethod "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${kw}&resultsPerPage=10" -TimeoutSec 25 -ErrorAction Stop
+            $resp = Invoke-NvdApi -Keyword $app.NvdKeyword -ResultsPerPage 10 -Retries 1
             foreach ($v in $resp.vulnerabilities) {
                 $pair = "$($v.cve.id)|$($app.Key)"; if (-not $SeenPairs.Add($pair)) { continue }
                 $sev = "UNKNOWN"; $score = $null; $cwe = ""
@@ -1093,8 +1128,24 @@ Start-Sleep -Seconds 1
 
 # ── Estatísticas para o tab Audit ─────────────────────────────────
 $txtFiles = Get-ChildItem "$Out\*.txt" -ErrorAction SilentlyContinue | Sort-Object Name
+
+# Cache: ler cada ficheiro UMA vez. Ficheiros grandes (>500KB) lê só primeiras 3000 linhas
+$FileCache = @{}
 foreach ($f in $txtFiles) {
-    $content = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+    try {
+        if ($f.Length -gt 500000) {
+            $FileCache[$f.FullName] = (Get-Content $f.FullName -TotalCount 3000 -Encoding UTF8 -ErrorAction SilentlyContinue) -join "`n"
+        } else {
+            $FileCache[$f.FullName] = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+        }
+    } catch {
+        $FileCache[$f.FullName] = ""
+        Write-Warn "Falha ao ler $($f.Name): $($_.Exception.Message)"
+    }
+}
+
+foreach ($f in $txtFiles) {
+    $content = $FileCache[$f.FullName]
     if ([string]::IsNullOrWhiteSpace($content)) { continue }
     $TotalCrit += ([regex]::Matches($content, "CRÍTICO|CRITICAL")).Count
     $TotalHigh += ([regex]::Matches($content, "\bHIGH\b|\[HIGH\]|ALERTA")).Count
@@ -1103,6 +1154,20 @@ foreach ($f in $txtFiles) {
 }
 $UniqCves = $AllCves.Count; $UniqCwes = $AllCwes.Count
 Write-Info "Audit stats: Critical=$TotalCrit High=$TotalHigh CVEs=$UniqCves CWEs=$UniqCwes"
+
+# Cache de contagens por ficheiro — usado pelo TOC e pelas secções
+$CountCache = @{}
+foreach ($f in $txtFiles) {
+    $c = $FileCache[$f.FullName]
+    if ([string]::IsNullOrWhiteSpace($c)) {
+        $CountCache[$f.FullName] = @{ Crit=0; High=0 }
+    } else {
+        $CountCache[$f.FullName] = @{
+            Crit = ([regex]::Matches($c, "CRÍTICO|CRITICAL")).Count
+            High = ([regex]::Matches($c, "\bHIGH\b|\[HIGH\]|ALERTA")).Count
+        }
+    }
+}
 
 # ── Estatísticas para o tab CVE Dashboard ─────────────────────────
 $CveCrit = ($CveResults | Where-Object { $_.Severity -eq "CRITICAL" }).Count
@@ -1114,13 +1179,14 @@ Write-Info "CVE dashboard: Critical=$CveCrit High=$CveHigh Total=$($CveResults.C
 # ── Top findings para Executive Summary ───────────────────────────
 $topFindings = [System.Collections.Generic.List[object]]::new()
 foreach ($f in $txtFiles) {
-    $content = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+    $content = $FileCache[$f.FullName]
     if ([string]::IsNullOrWhiteSpace($content)) { continue }
     $ms = [regex]::Matches($content, "^.{0,200}(CRÍTICO|CRITICAL|ALERTA).*$", "Multiline")
     $cnt = 0
     foreach ($m in $ms) {
         if ($cnt -ge 4) { break }
-        $line = $m.Value.Trim(); $sev = if ($line -match "CRÍTICO|CRITICAL") { "critical" } else { "high" }
+        $line = $m.Value.Trim()
+        $sev = if ($line -match "CRÍTICO|CRITICAL") { "critical" } else { "high" }
         $short = if ($line.Length -gt 180) { $line.Substring(0,180) } else { $line }
         $topFindings.Add([PSCustomObject]@{ Sev=$sev; Src=$f.BaseName; Msg=(Escape-Html $short) }); $cnt++
     }
@@ -1133,12 +1199,19 @@ $sevOrder = @{ "CRITICAL"=1; "HIGH"=2; "MEDIUM"=3; "LOW"=4; "UNKNOWN"=5 }
 foreach ($cve in ($AllCves | Sort-Object)) {
     $sev = "UNKNOWN"; $foundIn = ""; $desc = ""
     foreach ($f in $txtFiles) {
-        $content = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+        $content = $FileCache[$f.FullName]
+        if ([string]::IsNullOrWhiteSpace($content)) { continue }
         if ($content -match [regex]::Escape($cve)) {
             $foundIn = $f.BaseName
-            $idx = $content.IndexOf($cve); $start = [Math]::Max(0,$idx-100); $len = [Math]::Min(300,$content.Length-$start)
-            $ctx = $content.Substring($start,$len)
-            if ($ctx -match "\bCRITICAL\b") { $sev="CRITICAL" } elseif ($ctx -match "\bHIGH\b") { $sev="HIGH" } elseif ($ctx -match "\bMEDIUM\b") { $sev="MEDIUM" } elseif ($ctx -match "\bLOW\b") { $sev="LOW" }
+            # Heurística melhorada: procurar severity dentro de 80 chars do CVE
+            $proximityPattern = "$([regex]::Escape($cve)).{0,80}\b(CRITICAL|HIGH|MEDIUM|LOW)\b"
+            $sevMatch = [regex]::Match($content, $proximityPattern, "IgnoreCase")
+            if (-not $sevMatch.Success) {
+                # Tentar inverso — severity antes do CVE
+                $sevMatch = [regex]::Match($content, "\b(CRITICAL|HIGH|MEDIUM|LOW)\b.{0,80}$([regex]::Escape($cve))", "IgnoreCase")
+            }
+            if ($sevMatch.Success) { $sev = $sevMatch.Groups[1].Value.ToUpper() }
+            # Descrição: linha que contém "Desc:" próxima do CVE
             $dm = [regex]::Match($content,"$([regex]::Escape($cve))[^\n]*\n[^\n]*?Desc:\s*([^\n]{0,150})")
             if ($dm.Success) { $desc = Escape-Html $dm.Groups[1].Value.Trim() }
             break
@@ -1307,8 +1380,8 @@ foreach ($cat in $tocOrder) {
     $label = switch ($cat) { 'system' {'&#x1F5A5; System'} 'network' {'&#x1F310; Network'} 'privesc' {'&#x1F510; Privilege Escalation'} 'hardening' {'&#x1F6E1; Hardening'} 'cve' {'&#x1F41B; CVE / Vulnerabilities'} default {'&#x1F4C4; Other'} }
     [void]$sb.AppendLine("<div class=`"toc-cat`">$label</div>")
     foreach ($f in $files) {
-        $fc = ([regex]::Matches([System.IO.File]::ReadAllText($f.FullName,[System.Text.Encoding]::UTF8),"CRÍTICO|CRITICAL")).Count
-        $fh = ([regex]::Matches([System.IO.File]::ReadAllText($f.FullName,[System.Text.Encoding]::UTF8),"\bHIGH\b|\[HIGH\]|ALERTA")).Count
+        $fc = $CountCache[$f.FullName].Crit
+        $fh = $CountCache[$f.FullName].High
         $badges = ""
         if ($fc -gt 0) { $badges += "<span class=`"toc-mini tm-c`">$fc</span>" }
         if ($fh -gt 0) { $badges += "<span class=`"toc-mini tm-h`">$fh</span>" }
@@ -1391,24 +1464,29 @@ foreach ($cat in $tocOrder) {
     $label = switch ($cat) { 'system' {'&#x1F5A5; System'} 'network' {'&#x1F310; Network'} 'privesc' {'&#x1F510; Privilege Escalation'} 'hardening' {'&#x1F6E1; Hardening'} 'cve' {'&#x1F41B; CVE / Vulnerabilities'} default {'&#x1F4C4; Other'} }
     $catCrit = 0; $catHigh = 0
     foreach ($f in $files) {
-        $c = [System.IO.File]::ReadAllText($f.FullName,[System.Text.Encoding]::UTF8)
-        $catCrit += ([regex]::Matches($c,"CRÍTICO|CRITICAL")).Count
-        $catHigh += ([regex]::Matches($c,"\bHIGH\b|\[HIGH\]|ALERTA")).Count
+        $catCrit += $CountCache[$f.FullName].Crit
+        $catHigh += $CountCache[$f.FullName].High
     }
-    $catCls = "category" + (if($catCrit -gt 0){" has-crit"}else{""}) + (if($catHigh -gt 0){" has-high"}else{""})
+    $catCls = "category"
+    if ($catCrit -gt 0) { $catCls += " has-crit" }
+    if ($catHigh -gt 0) { $catCls += " has-high" }
     [void]$sb.AppendLine("<div class=`"$catCls`"><div class=`"category-h`">$label</div>")
     foreach ($f in $files) {
-        $content = [System.IO.File]::ReadAllText($f.FullName,[System.Text.Encoding]::UTF8)
-        $fc = ([regex]::Matches($content,"CRÍTICO|CRITICAL")).Count
-        $fh = ([regex]::Matches($content,"\bHIGH\b|\[HIGH\]|ALERTA")).Count
+        $content = $FileCache[$f.FullName]
+        if ([string]::IsNullOrWhiteSpace($content)) { $content = "(vazio)" }
+        $fc = $CountCache[$f.FullName].Crit
+        $fh = $CountCache[$f.FullName].High
         $badges = ""
         if ($fc -gt 0) { $badges += "<span class=`"badge b-crit`">$fc CRITICAL</span>" }
         if ($fh -gt 0) { $badges += "<span class=`"badge b-high`">$fh HIGH</span>" }
         if (-not $badges) { $badges = "<span class=`"badge b-ok`">OK</span>" }
-        $secCls = "sec" + (if($fc -gt 0){" has-crit"}else{""}) + (if($fh -gt 0){" has-high"}else{""}); $autoOpen = if($fc -gt 0 -or $fh -gt 0){" open"}else{""}
-        $truncated = $content.Split("`n") | Select-Object -First 3000 | Out-String
-        $contentEsc = Colorize-Html (Escape-Html $truncated)
-        if ($content.Length -gt 500000) { $contentEsc += "`n<span style='color:var(--yellow)'>[... truncado — ver .txt completo ...]</span>" }
+        $secCls = "sec"
+        if ($fc -gt 0) { $secCls += " has-crit" }
+        if ($fh -gt 0) { $secCls += " has-high" }
+        $autoOpen = ""
+        if ($fc -gt 0 -or $fh -gt 0) { $autoOpen = " open" }
+        $contentEsc = Colorize-Html (Escape-Html $content)
+        if ($f.Length -gt 500000) { $contentEsc += "`n<span style='color:var(--yellow)'>[... truncado a 3000 linhas — ver .txt completo ...]</span>" }
         [void]$sb.AppendLine("<div class=`"$secCls`" id=`"$($f.BaseName)`"><div class=`"sec-h`" onclick=`"toggle('$($f.BaseName)')`"><span class=`"sec-t`">&#128196; $($f.BaseName)</span><span>$badges</span></div><div class=`"sec-c$autoOpen`" id=`"$($f.BaseName)-content`"><pre>$contentEsc</pre></div></div>")
     }
     [void]$sb.AppendLine("</div>")

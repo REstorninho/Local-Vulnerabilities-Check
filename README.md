@@ -18,6 +18,106 @@ Cada script é a combinação de dois scripts anteriores num único ficheiro:
 
 ---
 
+## Features avançadas
+
+Os scripts suportam várias funcionalidades para uso em CI/CD e gestão de vulnerabilidades ao longo do tempo:
+
+### NVD API key — 10× mais rápido
+
+A NVD API tem rate limit muito mais elevado quando se usa uma API key. Sem key: 5 req/30s. Com key: 50 req/30s.
+
+Obter key gratuita em [nvd.nist.gov/developers/request-an-api-key](https://nvd.nist.gov/developers/request-an-api-key).
+
+```bash
+# Linux
+sudo bash linux-full-audit.sh --nvd-api-key "abc123..."
+NVD_API_KEY=abc123 sudo bash linux-full-audit.sh
+
+# Windows
+powershell -File windows-full-audit.ps1 -NvdApiKey "abc123..."
+$env:NVD_API_KEY = "abc123"; powershell -File windows-full-audit.ps1
+```
+
+Quando há key, o sleep entre batches passa de 32s para 6s e o número de apps analisadas no NVD lookup passa de 30 para 100.
+
+### Exports CSV e SARIF
+
+Além do `cve_results.json`, os scripts produzem automaticamente:
+
+| Ficheiro | Formato | Uso |
+|----------|---------|-----|
+| `cve_results.csv` | CSV padrão | Abrir em Excel/Sheets, partilhar com equipas |
+| `cve_results.sarif` | SARIF 2.1.0 | Ingerir em GitHub Code Scanning, Azure DevOps, GitLab |
+
+SARIF é o formato padrão da indústria — pode ser carregado directamente no GitHub Security tab via `actions/upload-sarif`, ou consumido por qualquer ferramenta de SAST/DAST que suporte o standard.
+
+### Comparação entre runs (diff)
+
+Comparar com um audit anterior produz um `diff_vs_previous.json` que destaca:
+
+- **Novos CVEs** — não existiam antes (preocupante — aparição de nova vulnerabilidade)
+- **CVEs resolvidos** — desapareceram (bom — confirma que o patch funcionou)
+- **Mudanças de severidade** — CVSS score mudou (re-avaliação NVD)
+
+```bash
+# Linux
+sudo bash linux-full-audit.sh --compare reports/host_20260515_1030/cve_results.json
+
+# Windows
+powershell -File windows-full-audit.ps1 -Compare "reports\host_20260515_1030\cve_results.json"
+```
+
+Transforma os scripts de "snapshot único" em "tracking de postura de segurança ao longo do tempo".
+
+### Exit codes semânticos (CI/CD)
+
+Por defeito os scripts saem com `0`. Com `--fail-on`/`-FailOn`, podem falhar o pipeline quando há findings ao nível especificado:
+
+```bash
+# Linux
+sudo bash linux-full-audit.sh --fail-on critical   # falha se houver Critical
+sudo bash linux-full-audit.sh --fail-on high       # falha se houver High ou Critical
+
+# Windows
+powershell -File windows-full-audit.ps1 -FailOn critical
+```
+
+Códigos de saída:
+
+| Code | Significado |
+|------|-------------|
+| `0` | Sucesso, sem findings ao nível especificado |
+| `1` | Erro de execução (ficheiros, paths inválidos, etc) |
+| `2` | `--fail-on critical` com Critical CVEs detectados |
+| `3` | `--fail-on high` com High CVEs detectados |
+| `4` | `--fail-on medium` com Medium CVEs detectados |
+
+### Cache global de Trivy e Grype
+
+A DB de vulnerabilidades do Trivy tem ~500MB e o Grype tem ~150MB. Por defeito são descarregadas para o home do utilizador. Os scripts redireccionam para `tools/trivy-cache/` e `tools/grype-cache/` — persistem entre execuções, poupam centenas de MB de tráfego e minutos por run.
+
+### Exemplo: pipeline GitHub Actions
+
+```yaml
+- name: Security audit
+  run: sudo bash linux-full-audit.sh --nvd-api-key ${{ secrets.NVD_API_KEY }} --fail-on critical
+  
+- name: Upload SARIF
+  if: always()
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: reports/*/cve_results.sarif
+    
+- name: Upload artifacts
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: audit-report
+    path: reports/
+```
+
+---
+
 ## Relatório HTML
 
 O relatório gerado tem **duas tabs**:
@@ -322,15 +422,23 @@ Checks adicionais específicos de distro: PwnKit (pkexec), overlayfs Ubuntu, run
 
 ---
 
-## Ficheiros JSON produzidos
+## Ficheiros produzidos
 
-Todos os dados estruturados ficam disponíveis em JSON para integração com outras ferramentas:
+Todos os dados estruturados ficam disponíveis em múltiplos formatos para integração com outras ferramentas:
 
-| Ficheiro | Conteúdo | Campos |
-|----------|----------|--------|
-| `inventory.json` | Apps e packages detectados | `key`, `name`, `version`, `category`, `nvd_keyword`, `source` |
-| `cve_results.json` | CVEs encontrados | `Source`, `App`, `Version`, `FixedIn`, `CveId`, `Severity`, `Cvss`, `Cwe`, `Description`, `References` |
-| `app_updates.json` | Updates disponíveis | `Source`, `Name`, `Current`, `Available`, `UpdateCmd` |
+| Ficheiro | Formato | Conteúdo | Uso |
+|----------|---------|----------|-----|
+| `inventory.json` | JSON | Apps e packages detectados | Inventário estruturado |
+| `cve_results.json` | JSON | CVEs com CVSS, CWE, FixedIn | Análise programática |
+| `cve_results.csv` | CSV | CVEs em formato tabular | Excel, Sheets, partilha |
+| `cve_results.sarif` | SARIF 2.1.0 | CVEs em formato padrão | GitHub Code Scanning, Azure DevOps, GitLab |
+| `app_updates.json` | JSON | Updates disponíveis + comandos | Patch management |
+| `diff_vs_previous.json` | JSON | Comparação com run anterior | Tracking de postura ao longo do tempo |
+| `REPORT_<host>_<date>.html` | HTML | Relatório interactivo | Visualização humana |
+
+Campos do `cve_results.json`: `Source` (Trivy/Grype/NVD), `App`, `Version`, `FixedIn`, `CveId`, `Severity`, `Cvss`, `Cwe`, `Title`, `Description`, `References`.
+
+Campos do `diff_vs_previous.json`: `summary` (counts), `new_cves`, `resolved_cves`, `severity_changes`.
 
 ---
 

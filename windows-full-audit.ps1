@@ -641,37 +641,45 @@ if (Test-Path $OsvBin) {
     Write-Info "OSV-Scanner — sistema OK ($OsvCmd)"
 } elseif (-not $SkipDownload) {
     Write-Info "A determinar versão mais recente do OSV-Scanner (google)..."
-    $osvZip = "$Tools\osv_tmp.zip"
-    $osvTmp = "$Tools\osv_extracted"
+    # OSV-Scanner distribui .exe directo — sem ZIP
     try {
-        $osvVer = Get-GitHubRelease `
-            -Repo        "google/osv-scanner" `
-            -AssetFilter "*windows*amd64*.zip" `
-            -Dest        $osvZip `
-            -MinBytes    5000000 `
-            -FallbackVer "2.3.8" `
-            -FallbackUrl "https://github.com/google/osv-scanner/releases/download/v2.3.8/osv-scanner_2.3.8_windows_amd64.zip" `
-            -ManualDest  $OsvBin
+        $osvVer = "2.3.8"  # fallback
+        try {
+            $rel = Invoke-RestMethod "https://api.github.com/repos/google/osv-scanner/releases/latest" -TimeoutSec 15 -ErrorAction Stop
+            $osvVer = $rel.tag_name.TrimStart("v")
+        } catch { Write-Warn "  OSV-Scanner: GitHub API inacessível — a usar v${osvVer}" }
 
-        if ($osvVer -and (Test-Path $osvZip)) {
-            New-Item -ItemType Directory -Force -Path $osvTmp | Out-Null
-            Expand-Archive -Path $osvZip -DestinationPath $osvTmp -Force -ErrorAction Stop
-            $exeFound = Get-ChildItem -Path $osvTmp -Filter "osv-scanner.exe" -Recurse -ErrorAction SilentlyContinue |
-                        Select-Object -First 1
-            if ($exeFound) {
-                Copy-Item $exeFound.FullName $OsvBin -Force
-                $OsvCmd = $OsvBin
-                $sz = [math]::Round((Get-Item $OsvBin).Length / 1MB, 1)
-                Write-Info "  OSV-Scanner v${osvVer} extraído OK ($sz MB)"
-            } else {
-                Write-Warn "  OSV-Scanner: ZIP descarregado mas osv-scanner.exe não encontrado"
-            }
+        $osvUrl = "https://github.com/google/osv-scanner/releases/download/v${osvVer}/osv-scanner_windows_amd64.exe"
+        Write-Info "  OSV-Scanner v${osvVer} — a descarregar .exe..."
+
+        # Teste rápido de conectividade
+        $osvHost = "objects.githubusercontent.com"
+        $osvReachable = $false
+        try {
+            $req = [System.Net.WebRequest]::Create("https://$osvHost"); $req.Timeout = 5000; $req.Method = "HEAD"
+            $resp = $req.GetResponse(); $resp.Close(); $osvReachable = $true
+        } catch {}
+
+        if (-not $osvReachable) {
+            Write-Warn "  $osvHost inacessível (firewall/proxy)"
+            Write-Host ""
+            Write-Host "  ┌─ INSTALAÇÃO MANUAL ─────────────────────────────────────┐" -ForegroundColor Yellow
+            Write-Host "  │ 1. Descarregar numa máquina com acesso à internet:       │" -ForegroundColor Yellow
+            Write-Host "  │    $osvUrl" -ForegroundColor Cyan
+            Write-Host "  │ 2. Copiar para: $OsvBin" -ForegroundColor Cyan
+            Write-Host "  │ 3. Re-executar (usará cache automaticamente)             │" -ForegroundColor Yellow
+            Write-Host "  └──────────────────────────────────────────────────────────┘" -ForegroundColor Yellow
+            Write-Host ""
+        } elseif (Safe-Download -Url $osvUrl -Dest $OsvBin -MinBytes 5000000) {
+            $OsvCmd = $OsvBin
+            $sz = [math]::Round((Get-Item $OsvBin).Length / 1MB, 1)
+            Write-Info "  OSV-Scanner v${osvVer} OK ($sz MB)"
+        } else {
+            Write-Warn "  OSV-Scanner: download falhou"
+            Write-Warn "  Manual: $osvUrl → $OsvBin"
         }
     } catch {
         Write-Warn "  OSV-Scanner: $($_.Exception.Message)"
-    } finally {
-        Remove-Item $osvZip -Force -ErrorAction SilentlyContinue
-        Remove-Item $osvTmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     if (-not $OsvCmd) { Write-Warn "  OSV-Scanner: não disponível — lock file scan será saltado" }
@@ -689,19 +697,22 @@ if (Test-Path $WatsonBin) {
     Write-Info "Watson — sistema OK"
 } elseif (-not $SkipDownload) {
     Write-Info "A determinar versão mais recente do Watson (jazzband)..."
+    # Watson usa source archive: /archive/refs/tags/<ver>.zip
     $watsonZip = "$Tools\watson_tmp.zip"
     $watsonTmp = "$Tools\watson_extracted"
     try {
-        $watsonVer = Get-GitHubRelease `
-            -Repo        "jazzband/Watson" `
-            -AssetFilter "*.zip" `
-            -Dest        $watsonZip `
-            -MinBytes    20000 `
-            -FallbackVer "2.1.0" `
-            -FallbackUrl "https://github.com/jazzband/Watson/releases/download/v2.1.0/Watson.zip" `
-            -ManualDest  $WatsonBin
+        # Obter última tag via API de tags (Watson não usa releases formais)
+        $watsonVer = "2.1.0"  # fallback
+        try {
+            $tags = Invoke-RestMethod "https://api.github.com/repos/jazzband/Watson/tags" -TimeoutSec 15 -ErrorAction Stop
+            if ($tags -and $tags.Count -gt 0) { $watsonVer = $tags[0].name.TrimStart("v") }
+        } catch { Write-Warn "  Watson: GitHub API inacessível — a usar v${watsonVer}" }
 
-        if ($watsonVer -and (Test-Path $watsonZip)) {
+        # URL do source archive (não precisa de objects.githubusercontent.com)
+        $watsonUrl = "https://github.com/jazzband/Watson/archive/refs/tags/${watsonVer}.zip"
+        Write-Info "  Watson v${watsonVer} — a descarregar source archive..."
+
+        if (Safe-Download -Url $watsonUrl -Dest $watsonZip -MinBytes 20000) {
             New-Item -ItemType Directory -Force -Path $watsonTmp | Out-Null
             Expand-Archive -Path $watsonZip -DestinationPath $watsonTmp -Force -ErrorAction Stop
             $exeFound = Get-ChildItem -Path $watsonTmp -Filter "Watson.exe" -Recurse -ErrorAction SilentlyContinue |
@@ -712,8 +723,12 @@ if (Test-Path $WatsonBin) {
                 $sz = [math]::Round((Get-Item $WatsonBin).Length / 1KB)
                 Write-Info "  Watson v${watsonVer} extraído OK ($sz KB)"
             } else {
-                Write-Warn "  Watson: ZIP descarregado mas Watson.exe não encontrado"
+                Write-Warn "  Watson: Watson.exe não encontrado no archive (só source code)"
+                Write-Warn "  Watson: compilação necessária — CVEs inline na fase 11 cobrem os casos principais"
             }
+        } else {
+            Write-Warn "  Watson: download falhou"
+            Write-Warn "  Manual: $watsonUrl → extrair Watson.exe → $WatsonBin"
         }
     } catch {
         Write-Warn "  Watson: $($_.Exception.Message)"

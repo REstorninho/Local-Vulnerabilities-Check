@@ -331,18 +331,88 @@ safe_count() {
 safe_download() {
     local url="$1" dest="$2" min_bytes="${3:-10240}"
     local curl_err; curl_err=$(mktemp 2>/dev/null) || curl_err="/tmp/curl_err_$$"
-    if curl -fsSL --connect-timeout 30 --max-time 120 -o "$dest" "$url" 2>"$curl_err"; then
-        local sz; sz=$(stat -c%s "$dest" 2>/dev/null || stat -f%z "$dest" 2>/dev/null || echo 0)
+    local sz=0
+
+    # Tentativa 1: curl com proxy do sistema (--proxy-negotiate honra $http_proxy/$https_proxy)
+    if curl -fsSL --connect-timeout 30 --max-time 120 \
+            --proxy-negotiate --anyauth \
+            -o "$dest" "$url" 2>"$curl_err"; then
+        sz=$(stat -c%s "$dest" 2>/dev/null || stat -f%z "$dest" 2>/dev/null || echo 0)
         if [[ "$sz" -ge "$min_bytes" ]]; then rm -f "$curl_err"; return 0; fi
         rm -f "$dest"
-        log_error WARN "Download suspeito (${sz} bytes < ${min_bytes} mínimo)" "\"url\":\"${url//\"/\\\"}\",\"size\":${sz}"
-        echo -e "${YELLOW}[!]${NC}   Download suspeito ($sz bytes): $dest"
-    else
-        local em; em=$(head -c 200 "$curl_err" 2>/dev/null)
-        log_error WARN "Falha no download" "\"url\":\"${url//\"/\\\"}\",\"curl_error\":\"${em//\"/\\\"}\""
-        echo -e "${YELLOW}[!]${NC}   Falha no download: $url"
     fi
+
+    # Tentativa 2: curl com --insecure (alguns proxies SSL inspection quebram o certificado)
+    if curl -fsSL --connect-timeout 30 --max-time 120 --insecure \
+            -o "$dest" "$url" 2>>"$curl_err"; then
+        sz=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+        if [[ "$sz" -ge "$min_bytes" ]]; then rm -f "$curl_err"; return 0; fi
+        rm -f "$dest"
+    fi
+
+    # Tentativa 3: wget como alternativa (stack HTTP diferente do curl)
+    if command -v wget &>/dev/null; then
+        if wget -q --timeout=120 --tries=2 -O "$dest" "$url" 2>>"$curl_err"; then
+            sz=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+            if [[ "$sz" -ge "$min_bytes" ]]; then rm -f "$curl_err"; return 0; fi
+            rm -f "$dest"
+        fi
+    fi
+
+    local em; em=$(head -c 200 "$curl_err" 2>/dev/null)
+    log_error WARN "Falha no download" "\"url\":\"${url//\"/\\\"}\",\"curl_error\":\"${em//\"/\\\"}\""
+    echo -e "${YELLOW}[!]${NC}   Falha no download: $url"
     rm -f "$curl_err"
+    return 1
+}
+
+# github_release_download — descarrega asset ZIP de release do GitHub
+# Tenta múltiplos métodos porque objects.githubusercontent.com pode estar bloqueado
+# Uso: github_release_download "owner/repo" "*linux*amd64*.zip" "/dest/file.zip" min_bytes fallback_ver fallback_url
+# Retorna: versão descarregada no stdout, exit 0 = sucesso, exit 1 = falha
+github_release_download() {
+    local repo="$1" asset_filter="$2" dest="$3" min_bytes="${4:-10240}"
+    local fallback_ver="${5:-}" fallback_url="${6:-}"
+    local ver="$fallback_ver" asset_url="$fallback_url"
+
+    # 1. Obter metadados via API
+    local api_resp
+    api_resp=$(curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null) || api_resp=""
+    if [[ -n "$api_resp" ]]; then
+        ver=$(echo "$api_resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))" 2>/dev/null || echo "$fallback_ver")
+        # Procurar asset que corresponde ao filtro
+        local found_url
+        found_url=$(echo "$api_resp" | python3 -c "
+import sys,json,fnmatch
+try:
+    data=json.load(sys.stdin)
+    pat='${asset_filter}'
+    for a in data.get('assets',[]):
+        if fnmatch.fnmatch(a['name'], pat):
+            print(a['browser_download_url']); break
+except: pass
+" 2>/dev/null || echo "")
+        [[ -n "$found_url" ]] && asset_url="$found_url"
+        info "  v${ver} — $(basename "$asset_url")"
+    else
+        warn "  GitHub API inacessível — a usar fallback v${fallback_ver}"
+    fi
+    [[ -z "$asset_url" ]] && { warn "  Sem URL de download disponível"; return 1; }
+
+    # 2. Tentar safe_download (curl múltiplas tentativas + wget)
+    if safe_download "$asset_url" "$dest" "$min_bytes"; then echo "$ver"; return 0; fi
+
+    # 3. curl com header Accept: application/octet-stream (pode ser tratado diferente por proxies)
+    info "  A tentar com Accept: application/octet-stream..."
+    if curl -fsSL --max-time 120 -H "Accept: application/octet-stream" \
+            -o "$dest" "$asset_url" 2>/dev/null; then
+        local sz; sz=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+        if [[ "$sz" -ge "$min_bytes" ]]; then echo "$ver"; return 0; fi
+        rm -f "$dest"
+    fi
+
+    warn "  Todos os métodos falharam."
+    warn "  Para instalar manualmente: $asset_url"
     return 1
 }
 
@@ -594,16 +664,57 @@ fi
 
 # ── OSV-Scanner ───────────────────────────────────────────────────
 OSV_BIN="${TOOLS}/osv-scanner"
-if [[ ! -f "$OSV_BIN" ]] || [[ "$FORCE" == "true" ]]; then
-    OSV_VER=$(curl -fsSL "https://api.github.com/repos/google/osv-scanner/releases/latest" \
-              2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))" \
-              2>/dev/null || echo "1.7.4")
-    case "$ARCH" in x86_64) OA="linux-amd64";; aarch64) OA="linux-arm64";; *) OA="linux-amd64";; esac
-    OSV_URL="https://github.com/google/osv-scanner/releases/download/v${OSV_VER}/osv-scanner_${OA}"
-    ensure_tool "OSV-Scanner" "$OSV_BIN" "$OSV_URL" 5000000
-else
+OSV_CMD=""
+
+if [[ -f "$OSV_BIN" ]] && [[ "$FORCE" == "false" ]]; then
+    OSV_CMD="$OSV_BIN"
     sz=$(stat -c%s "$OSV_BIN" 2>/dev/null || echo 0)
     info "OSV-Scanner — cache OK ($(( sz / 1048576 )) MB)"
+elif command -v osv-scanner &>/dev/null && [[ "$FORCE" == "false" ]]; then
+    OSV_CMD=$(command -v osv-scanner)
+    info "OSV-Scanner — sistema OK ($OSV_CMD)"
+elif [[ "$SKIP_DOWNLOAD" == "false" ]] || [[ "$FORCE" == "true" ]]; then
+    info "A determinar versão mais recente do OSV-Scanner (google)..."
+    OSV_ZIP="${TOOLS}/osv_tmp.zip"
+    OSV_TMP="${TOOLS}/osv_extracted"
+
+    # Determinar filtro de arquitectura para o asset
+    case "$ARCH" in
+        x86_64)  OSV_FILTER="*linux_amd64*.zip" ;;
+        aarch64) OSV_FILTER="*linux_arm64*.zip" ;;
+        armv7*)  OSV_FILTER="*linux_arm*.zip"   ;;
+        *)       OSV_FILTER="*linux_amd64*.zip" ;;
+    esac
+    # Fallback URL com versão conhecida
+    OSV_FALLBACK_URL="https://github.com/google/osv-scanner/releases/download/v2.3.8/osv-scanner_2.3.8_linux_amd64.zip"
+    [[ "$ARCH" == "aarch64" ]] && OSV_FALLBACK_URL="https://github.com/google/osv-scanner/releases/download/v2.3.8/osv-scanner_2.3.8_linux_arm64.zip"
+
+    OSV_VER=$(github_release_download \
+        "google/osv-scanner" "$OSV_FILTER" "$OSV_ZIP" 5000000 \
+        "2.3.8" "$OSV_FALLBACK_URL") && {
+        mkdir -p "$OSV_TMP"
+        if unzip -q "$OSV_ZIP" -d "$OSV_TMP" 2>/dev/null; then
+            EXE_FOUND=$(find "$OSV_TMP" -type f \( -name "osv-scanner" -o -name "osv-scanner_*" \) \
+                        ! -name "*.zip" ! -name "*.sha256" 2>/dev/null | head -1)
+            if [[ -n "$EXE_FOUND" ]]; then
+                cp "$EXE_FOUND" "$OSV_BIN"
+                chmod +x "$OSV_BIN"
+                OSV_CMD="$OSV_BIN"
+                sz=$(stat -c%s "$OSV_BIN" 2>/dev/null || echo 0)
+                info "  OSV-Scanner v${OSV_VER} extraído OK ($(( sz / 1048576 )) MB)"
+            else
+                warn "  OSV-Scanner: binário não encontrado dentro do ZIP"
+            fi
+        else
+            warn "  OSV-Scanner: falha ao extrair ZIP"
+        fi
+    } || warn "  OSV-Scanner: download falhou"
+
+    # Limpar temporários sempre
+    rm -f "$OSV_ZIP"
+    rm -rf "$OSV_TMP"
+
+    [[ -z "$OSV_CMD" ]] && warn "  OSV-Scanner: não disponível — lock file scan será saltado"
 fi
 
 # ── linux-exploit-suggester-2 ─────────────────────────────────────
@@ -1015,9 +1126,9 @@ echo ""
 
 # OSV-Scanner
 echo "══ OSV-SCANNER ══"; echo ""
-if [[ -x "$OSV_BIN" ]]; then
-    timeout 180 "$OSV_BIN" --format table --installed 2>/dev/null || \
-        timeout 180 "$OSV_BIN" --format table --fs / 2>/dev/null || echo "  OSV --installed não suportado"
+if [[ -n "$OSV_CMD" ]] && [[ -x "$OSV_CMD" ]]; then
+    timeout 180 "$OSV_CMD" --format table --installed 2>/dev/null || \
+        timeout 180 "$OSV_CMD" --format table --fs / 2>/dev/null || echo "  OSV --installed não suportado"
     echo ""
     echo "--- Lock files ---"
     # -xdev: não atravessar mountpoints (NFS, FUSE, etc — podem travar)
@@ -1029,13 +1140,13 @@ if [[ -x "$OSV_BIN" ]]; then
         2>/dev/null | head -20)
     [[ -n "$LOCK_FILES" ]] && echo "$LOCK_FILES" | while IFS= read -r lf; do
         echo "  Scanning: $lf"
-        timeout 60 "$OSV_BIN" --format table --lockfile "$lf" 2>/dev/null || true
+        timeout 60 "$OSV_CMD" --format table --lockfile "$lf" 2>/dev/null || true
     done || echo "  Sem lock files encontrados"
     SBOM_OUT="${OUT}/11_sbom.cdx.json"
-    timeout 180 "$OSV_BIN" scan --format cyclonedx-1-4 --installed --output "$SBOM_OUT" 2>/dev/null && \
+    timeout 180 "$OSV_CMD" scan --format cyclonedx-1-4 --installed --output "$SBOM_OUT" 2>/dev/null && \
         echo "SBOM gerado: ${SBOM_OUT}" || true
 else
-    echo "[!] OSV-Scanner não disponível"
+    echo "[!] OSV-Scanner não disponível (ver log para detalhes)"
 fi
 echo ""
 

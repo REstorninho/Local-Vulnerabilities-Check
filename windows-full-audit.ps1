@@ -267,31 +267,42 @@ if ($NoNvd)        { Write-Warn "NVD lookup desactivado" }
 
 function Safe-Download {
     param([string]$Url, [string]$Dest, [int]$MinBytes = 10240)
-    # Tentar 1: Invoke-WebRequest com proxy do sistema
-    try {
-        $wc = [System.Net.WebRequest]::GetSystemWebProxy()
-        $wc.Credentials = [System.Net.CredentialCache]::DefaultCredentials
-        Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing -TimeoutSec 90 `
-            -Proxy ($wc.GetProxy($Url)) -ProxyUseDefaultCredentials -ErrorAction Stop
-        if ((Test-Path $Dest) -and (Get-Item $Dest).Length -ge $MinBytes) { return $true }
-        Remove-Item $Dest -Force -ErrorAction SilentlyContinue
-    } catch {}
-    # Tentar 2: Invoke-WebRequest sem proxy explícito
-    try {
-        Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing -TimeoutSec 90 -ErrorAction Stop
-        if ((Test-Path $Dest) -and (Get-Item $Dest).Length -ge $MinBytes) { return $true }
-        Remove-Item $Dest -Force -ErrorAction SilentlyContinue
-    } catch {}
-    # Tentar 3: .NET WebClient (usa configuração de proxy do sistema automaticamente)
-    try {
-        $wc = New-Object System.Net.WebClient
-        $wc.UseDefaultCredentials = $true
-        $wc.Proxy = [System.Net.WebRequest]::GetSystemWebProxy()
-        $wc.Proxy.Credentials = [System.Net.CredentialCache]::DefaultCredentials
-        $wc.DownloadFile($Url, $Dest)
-        if ((Test-Path $Dest) -and (Get-Item $Dest).Length -ge $MinBytes) { return $true }
-        Remove-Item $Dest -Force -ErrorAction SilentlyContinue
-    } catch {}
+
+    $attempts = @(
+        # 1: IWR com proxy do sistema
+        { Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing -TimeoutSec 90 `
+            -Proxy ([System.Net.WebRequest]::GetSystemWebProxy().GetProxy($Url)) `
+            -ProxyUseDefaultCredentials -ErrorAction Stop },
+        # 2: IWR sem proxy explícito
+        { Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing -TimeoutSec 90 -ErrorAction Stop },
+        # 3: .NET WebClient (proxy do sistema automático)
+        {
+            $wc = New-Object System.Net.WebClient
+            $wc.UseDefaultCredentials = $true
+            $wc.Proxy = [System.Net.WebRequest]::GetSystemWebProxy()
+            $wc.Proxy.Credentials = [System.Net.CredentialCache]::DefaultCredentials
+            $wc.DownloadFile($Url, $Dest)
+        },
+        # 4: BITS (Background Intelligent Transfer Service) — usa canal diferente, contorna alguns firewalls
+        {
+            $job = Start-BitsTransfer -Source $Url -Destination $Dest -Asynchronous -ErrorAction Stop
+            $timeout = 90; $elapsed = 0
+            while ($job.JobState -notin @("Transferred","Error","Cancelled") -and $elapsed -lt $timeout) {
+                Start-Sleep -Seconds 2; $elapsed += 2
+            }
+            if ($job.JobState -eq "Transferred") { Complete-BitsTransfer -BitsJob $job }
+            else { Remove-BitsTransfer -BitsJob $job -ErrorAction SilentlyContinue; throw "BITS timeout/error" }
+        }
+    )
+
+    foreach ($attempt in $attempts) {
+        try {
+            & $attempt
+            if ((Test-Path $Dest) -and (Get-Item $Dest).Length -ge $MinBytes) { return $true }
+            Remove-Item $Dest -Force -ErrorAction SilentlyContinue
+        } catch {}
+    }
+
     Write-Warn "  Download falhou: $Url"
     return $false
 }
@@ -309,6 +320,59 @@ function Ensure-Tool {
         }
     }
     Write-Warn "  $Name — download falhou"; return $false
+}
+# Get-GitHubRelease — descarrega asset ZIP de release do GitHub
+# Tenta múltiplos métodos porque github.com/releases/download (objects.githubusercontent.com)
+# pode estar bloqueado por firewalls mesmo quando api.github.com funciona.
+function Get-GitHubRelease {
+    param(
+        [string]$Repo,          # ex: "google/osv-scanner"
+        [string]$AssetFilter,   # ex: "*windows*amd64*.zip"
+        [string]$Dest,          # path destino do ZIP
+        [int]$MinBytes    = 10240,
+        [string]$FallbackVer = "",   # versão a usar se API falhar
+        [string]$FallbackUrl = ""    # URL completa se API não tiver o asset
+    )
+
+    # 1. Obter metadados da release via API
+    $ver = $FallbackVer; $assetUrl = $FallbackUrl
+    try {
+        $rel    = Invoke-RestMethod "https://api.github.com/repos/${Repo}/releases/latest" -TimeoutSec 15 -ErrorAction Stop
+        $ver    = $rel.tag_name.TrimStart("v")
+        $asset  = $rel.assets | Where-Object { $_.name -like $AssetFilter } | Select-Object -First 1
+        if ($asset) { $assetUrl = $asset.browser_download_url }
+        Write-Info "  v${ver} — $(Split-Path $assetUrl -Leaf)"
+    } catch {
+        Write-Warn "  GitHub API inacessível — a usar fallback v${ver}"
+    }
+    if (-not $assetUrl) { Write-Warn "  Sem URL de download disponível"; return $null }
+
+    # 2. Tentar Safe-Download (IWR + WebClient + BITS)
+    if (Safe-Download -Url $assetUrl -Dest $Dest -MinBytes $MinBytes) { return $ver }
+
+    # 3. Invoke-RestMethod -OutFile (header Accept diferente — pode ser tratado diferente pelo proxy)
+    Write-Info "  A tentar Invoke-RestMethod com Accept: application/octet-stream..."
+    try {
+        Invoke-RestMethod -Uri $assetUrl -OutFile $Dest -TimeoutSec 120 `
+            -Headers @{ Accept = "application/octet-stream"; "User-Agent" = "PowerShell" } -ErrorAction Stop
+        if ((Test-Path $Dest) -and (Get-Item $Dest).Length -ge $MinBytes) { return $ver }
+        Remove-Item $Dest -Force -ErrorAction SilentlyContinue
+    } catch {}
+
+    # 4. curl.exe nativo do Windows 10 1803+ (usa WinHTTP em vez de WinINet — stack diferente)
+    $curlExe = "$env:SystemRoot\System32\curl.exe"
+    if (Test-Path $curlExe) {
+        Write-Info "  A tentar curl.exe nativo (WinHTTP)..."
+        try {
+            & $curlExe -fsSL --max-time 120 --proxy-negotiate -o $Dest $assetUrl 2>&1 | Out-Null
+            if ((Test-Path $Dest) -and (Get-Item $Dest).Length -ge $MinBytes) { return $ver }
+            Remove-Item $Dest -Force -ErrorAction SilentlyContinue
+        } catch {}
+    }
+
+    Write-Warn "  Todos os métodos falharam."
+    Write-Warn "  Para instalar manualmente: $assetUrl"
+    return $null
 }
 
 function Run-Scan {
@@ -547,21 +611,17 @@ if (Test-Path $OsvBin) {
     $osvZip = "$Tools\osv_tmp.zip"
     $osvTmp = "$Tools\osv_extracted"
     try {
-        # GitHub API — última release de google/osv-scanner
-        $rel = Invoke-RestMethod "https://api.github.com/repos/google/osv-scanner/releases/latest" -TimeoutSec 15 -ErrorAction Stop
-        $osvVer = $rel.tag_name.TrimStart("v")
+        $osvVer = Get-GitHubRelease `
+            -Repo        "google/osv-scanner" `
+            -AssetFilter "*windows*amd64*.zip" `
+            -Dest        $osvZip `
+            -MinBytes    5000000 `
+            -FallbackVer "2.3.8" `
+            -FallbackUrl "https://github.com/google/osv-scanner/releases/download/v2.3.8/osv-scanner_2.3.8_windows_amd64.zip"
 
-        # Procurar asset ZIP windows-amd64 na release
-        $zipAsset = $rel.assets | Where-Object { $_.name -like "*windows*amd64*.zip" -or $_.name -like "*windows_amd64*.zip" } | Select-Object -First 1
-        $zipUrl   = if ($zipAsset) { $zipAsset.browser_download_url }
-                    else { "https://github.com/google/osv-scanner/releases/download/v${osvVer}/osv-scanner_${osvVer}_windows_amd64.zip" }
-
-        Write-Info "  OSV-Scanner v${osvVer} — a descarregar ZIP..."
-        if (Safe-Download -Url $zipUrl -Dest $osvZip -MinBytes 5000000) {
+        if ($osvVer -and (Test-Path $osvZip)) {
             New-Item -ItemType Directory -Force -Path $osvTmp | Out-Null
             Expand-Archive -Path $osvZip -DestinationPath $osvTmp -Force -ErrorAction Stop
-
-            # Procurar osv-scanner.exe dentro do ZIP (pode estar em subdirectório)
             $exeFound = Get-ChildItem -Path $osvTmp -Filter "osv-scanner.exe" -Recurse -ErrorAction SilentlyContinue |
                         Select-Object -First 1
             if ($exeFound) {
@@ -570,10 +630,8 @@ if (Test-Path $OsvBin) {
                 $sz = [math]::Round((Get-Item $OsvBin).Length / 1MB, 1)
                 Write-Info "  OSV-Scanner v${osvVer} extraído OK ($sz MB)"
             } else {
-                Write-Warn "  OSV-Scanner: ZIP descarregado mas osv-scanner.exe não encontrado dentro do arquivo"
+                Write-Warn "  OSV-Scanner: ZIP descarregado mas osv-scanner.exe não encontrado"
             }
-        } else {
-            Write-Warn "  OSV-Scanner: download do ZIP falhou"
         }
     } catch {
         Write-Warn "  OSV-Scanner: $($_.Exception.Message)"
@@ -582,9 +640,7 @@ if (Test-Path $OsvBin) {
         Remove-Item $osvTmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    if (-not $OsvCmd) {
-        Write-Warn "  OSV-Scanner: não disponível — lock file scan será saltado"
-    }
+    if (-not $OsvCmd) { Write-Warn "  OSV-Scanner: não disponível — lock file scan será saltado" }
 }
 
 # ── Watson ────────────────────────────────────────────────────────
@@ -602,21 +658,17 @@ if (Test-Path $WatsonBin) {
     $watsonZip = "$Tools\watson_tmp.zip"
     $watsonTmp = "$Tools\watson_extracted"
     try {
-        # GitHub API — última release de jazzband/Watson
-        $rel = Invoke-RestMethod "https://api.github.com/repos/jazzband/Watson/releases/latest" -TimeoutSec 15 -ErrorAction Stop
-        $watsonVer = $rel.tag_name.TrimStart("v")
+        $watsonVer = Get-GitHubRelease `
+            -Repo        "jazzband/Watson" `
+            -AssetFilter "*.zip" `
+            -Dest        $watsonZip `
+            -MinBytes    20000 `
+            -FallbackVer "2.1.0" `
+            -FallbackUrl "https://github.com/jazzband/Watson/releases/download/v2.1.0/Watson.zip"
 
-        # Procurar asset ZIP na release
-        $zipAsset = $rel.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
-        $zipUrl   = if ($zipAsset) { $zipAsset.browser_download_url }
-                    else { "https://github.com/jazzband/Watson/releases/download/v${watsonVer}/Watson.zip" }
-
-        Write-Info "  Watson v${watsonVer} — a descarregar ZIP ($zipUrl)..."
-        if (Safe-Download -Url $zipUrl -Dest $watsonZip -MinBytes 20000) {
+        if ($watsonVer -and (Test-Path $watsonZip)) {
             New-Item -ItemType Directory -Force -Path $watsonTmp | Out-Null
             Expand-Archive -Path $watsonZip -DestinationPath $watsonTmp -Force -ErrorAction Stop
-
-            # Procurar Watson.exe dentro do ZIP (pode estar em subdirectório)
             $exeFound = Get-ChildItem -Path $watsonTmp -Filter "Watson.exe" -Recurse -ErrorAction SilentlyContinue |
                         Select-Object -First 1
             if ($exeFound) {
@@ -625,22 +677,17 @@ if (Test-Path $WatsonBin) {
                 $sz = [math]::Round((Get-Item $WatsonBin).Length / 1KB)
                 Write-Info "  Watson v${watsonVer} extraído OK ($sz KB)"
             } else {
-                Write-Warn "  Watson: ZIP descarregado mas Watson.exe não encontrado dentro do arquivo"
+                Write-Warn "  Watson: ZIP descarregado mas Watson.exe não encontrado"
             }
-        } else {
-            Write-Warn "  Watson: download do ZIP falhou"
         }
     } catch {
         Write-Warn "  Watson: $($_.Exception.Message)"
     } finally {
-        # Limpar temporários independentemente do resultado
         Remove-Item $watsonZip -Force -ErrorAction SilentlyContinue
         Remove-Item $watsonTmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    if (-not $WatsonCmd) {
-        Write-Warn "  Watson: não disponível — os CVEs inline na fase 11 continuam activos"
-    }
+    if (-not $WatsonCmd) { Write-Warn "  Watson: não disponível — CVEs inline na fase 11 continuam activos" }
 }
 
 # Actualizar referência usada na fase 11

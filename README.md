@@ -11,11 +11,6 @@ Dois scripts de auditoria de segurança — um para Windows, outro para Linux �
 | `windows-full-audit.ps1` | Windows (PS 5.1+) | Auditoria completa + CVE Dashboard |
 | `linux-full-audit.sh` | Linux (bash) | Auditoria completa + CVE Dashboard |
 
-Cada script é a combinação de dois scripts anteriores num único ficheiro:
-
-- **`windows-audit.ps1` + `vuln-check.ps1`** → `windows-full-audit.ps1`
-- **`linux-audit.sh` + `vuln-check.sh`** → `linux-full-audit.sh`
-
 ---
 
 ## Features avançadas

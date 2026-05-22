@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  linux-full-audit.sh — Auditoria Completa + CVE/CWE Analyser   ║
+# ║  Author: Ricardo | Version: 2.0 | Date: 2026-05-22             ║
 # ║  Combina: linux-audit.sh + vuln-check.sh                        ║
 # ║  Uso: sudo bash linux-full-audit.sh [OPÇÕES]                    ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -264,7 +265,7 @@ mkdir -p "$OUT" "$TOOLS"
 # Inicializar logs estruturados — após mkdir
 echo "# audit_events.log — JSON Lines, todos os eventos. Filtrar com: jq 'select(.level==\"ERROR\")' $EVENT_LOG" > "$EVENT_LOG"
 echo "# audit_errors.log — só ERROR e WARN" > "$ERROR_LOG"
-log_jsonl "INFO" "Script iniciado" "\"version\":\"1.0\",\"args\":\"$*\",\"pid\":$$"
+log_jsonl "INFO" "Script iniciado" "\"version\":\"2.0\",\"date\":\"2026-05-22\",\"args\":\"$*\",\"pid\":$$"
 
 # Cache global de Trivy e Grype DBs — persiste entre runs (#4)
 # Poupa ~600MB de download por run
@@ -1060,17 +1061,29 @@ check_cve() {
     fi
 }
 
+# ── 2025 ──
+check_cve "CVE-2025-21756" "CRÍTICO" "vsock use-after-free LPE"                        "6.13.3" "Exploited in-the-wild (CVSS 7.8)"
+check_cve "CVE-2025-0927"  "HIGH"    "hfs/hfsplus heap buffer overflow LPE"            "6.13.0" "LPE via HFS filesystem mount"
+# ── 2024 ──
+check_cve "CVE-2024-53104" "HIGH"    "uvcvideo out-of-bounds write (USB camera)"       "6.12.9" "LPE via malicious USB device"
+check_cve "CVE-2024-36971" "CRÍTICO" "IPv6 net/core UAF (kernel routing)"              "6.9.4"  "Exploited in-the-wild (Android/Linux)"
+check_cve "CVE-2024-26925" "HIGH"    "nf_tables mutex double-free UAF"                 "6.8.9"  "netfilter race condition LPE"
+check_cve "CVE-2024-26585" "HIGH"    "TLS in-kernel race condition (TLS 1.3)"          "6.8.2"  "info leak / kernel memory corruption"
+check_cve "CVE-2024-1085"  "HIGH"    "nf_tables nft_set_pipapo UAF"                    "6.6.15" "LPE via netfilter"
 check_cve "CVE-2024-1086"  "CRÍTICO" "nf_tables use-after-free (LPE/container escape)" "6.6.15" "Exploited in-the-wild"
 check_cve "CVE-2024-0646"  "CRÍTICO" "mremap() out-of-bounds write"                    "6.6.6"  "Kernel memory corruption LPE"
 check_cve "CVE-2024-26581" "HIGH"    "nft_set_rbtree UAF"                               "6.7.3"  "netfilter UAF"
+# ── 2023 ──
 check_cve "CVE-2023-6931"  "HIGH"    "perf_group_detach out-of-bounds"                 "6.7.0"  "LPE via perf"
 check_cve "CVE-2023-4623"  "CRÍTICO" "sch_hfsc UAF (net/sched)"                        "6.5.3"  "LPE — exploits activos"
 check_cve "CVE-2023-3389"  "HIGH"    "io_uring UAF (IORING_OP_SPLICE)"                 "6.3.8"  "LPE via io_uring"
 check_cve "CVE-2023-32629" "CRÍTICO" "overlayfs privesc (Ubuntu)"                      "6.2.0"  "Exploited in-the-wild Ubuntu"
 check_cve "CVE-2023-2640"  "CRÍTICO" "overlayfs Ubuntu privesc"                        "6.2.0"  "Par com CVE-2023-32629"
+# ── 2022 ──
 check_cve "CVE-2022-3910"  "CRÍTICO" "cls_u32 UAF (net/sched)"                         "6.0.7"  "LPE"
 check_cve "CVE-2022-0847"  "CRÍTICO" "Dirty Pipe"                                      "5.16.11" "Exploited in-the-wild"
 check_cve "CVE-2022-0185"  "CRÍTICO" "fsconfig heap overflow"                          "5.16.2" "LPE com user namespace"
+# ── 2021 e anterior ──
 check_cve "CVE-2021-4034"  "CRÍTICO" "PwnKit — pkexec LPE"                             "0.0.0"  "pkexec (polkit), não kernel"
 check_cve "CVE-2021-22555" "CRÍTICO" "netfilter heap OOB write"                        "5.12.13" "Exploited in-the-wild"
 check_cve "CVE-2021-3156"  "CRÍTICO" "Baron Samedit — sudo heap overflow"              "0.0.0"  "sudo <1.9.5p2"
@@ -1613,7 +1626,7 @@ sarif = {
             "driver": {
                 "name": "linux-full-audit",
                 "version": "1.0",
-                "informationUri": "https://github.com/user/security-audit-scripts",
+                "informationUri": "https://github.com/REstorninho/local-vulnerabilities-check",
                 "rules": list(rules_dict.values())
             }
         },

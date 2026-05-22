@@ -1,6 +1,7 @@
 ﻿
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  windows-full-audit.ps1 — Auditoria Completa + CVE Dashboard   ║
+# ║  Author: Ricardo | Version: 2.0 | Date: 2026-05-22             ║
 # ║  Combina: windows-audit.ps1 + vuln-check.ps1                   ║
 # ║  Uso: powershell -ExecutionPolicy Bypass -File windows-full-audit.ps1 ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -205,7 +206,7 @@ New-Item -ItemType Directory -Force -Path $Out, $Tools | Out-Null
 "# audit_events.log - JSON Lines, todos os eventos" | Out-File $Global:EventLog -Encoding UTF8 -Force
 "# audit_errors.log - so ERROR e WARN" | Out-File $Global:ErrorLog -Encoding UTF8 -Force
 Write-LogJsonl -Level "INFO" -Message "Script iniciado" -Extra @{
-    version = "1.0"
+    version = "2.0"
     args    = ($PSBoundParameters.Keys -join ",")
     pid     = $PID
 }
@@ -696,36 +697,27 @@ if (Test-Path $WatsonBin) {
     $WatsonCmd = (Get-Command Watson).Source
     Write-Info "Watson — sistema OK"
 } elseif (-not $SkipDownload) {
-    Write-Info "A determinar versão mais recente do Watson (jazzband)..."
-    # Watson usa source archive: /archive/refs/tags/<ver>.zip
+    Write-Info "A determinar versão mais recente do Watson (rasta-mouse)..."
+    # Watson: Windows unpatched CVE checker by rasta-mouse (Daniel Duggan)
+    # Compilado via Ghostpack-CompiledBinaries ou download directo
     $watsonZip = "$Tools\watson_tmp.zip"
     $watsonTmp = "$Tools\watson_extracted"
     try {
-        # Obter última tag via API de tags (Watson não usa releases formais)
-        $watsonVer = "2.1.0"  # fallback
+        # Obter release mais recente via GitHub API
+        $watsonVer = "2.0"  # fallback
         try {
-            $tags = Invoke-RestMethod "https://api.github.com/repos/jazzband/Watson/tags" -TimeoutSec 15 -ErrorAction Stop
-            if ($tags -and $tags.Count -gt 0) { $watsonVer = $tags[0].name.TrimStart("v") }
+            $rel = Invoke-RestMethod "https://api.github.com/repos/rasta-mouse/Watson/releases/latest" -TimeoutSec 15 -ErrorAction Stop
+            if ($rel.tag_name) { $watsonVer = $rel.tag_name.TrimStart("v") }
         } catch { Write-Warn "  Watson: GitHub API inacessível — a usar v${watsonVer}" }
 
-        # URL do source archive (não precisa de objects.githubusercontent.com)
-        $watsonUrl = "https://github.com/jazzband/Watson/archive/refs/tags/${watsonVer}.zip"
-        Write-Info "  Watson v${watsonVer} — a descarregar source archive..."
+        # Tentar descarregar Watson.exe de Ghostpack-CompiledBinaries
+        $watsonGhostUrl = "https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/Watson.exe"
+        Write-Info "  Watson v${watsonVer} — a descarregar de Ghostpack-CompiledBinaries..."
 
-        if (Safe-Download -Url $watsonUrl -Dest $watsonZip -MinBytes 20000) {
-            New-Item -ItemType Directory -Force -Path $watsonTmp | Out-Null
-            Expand-Archive -Path $watsonZip -DestinationPath $watsonTmp -Force -ErrorAction Stop
-            $exeFound = Get-ChildItem -Path $watsonTmp -Filter "Watson.exe" -Recurse -ErrorAction SilentlyContinue |
-                        Select-Object -First 1
-            if ($exeFound) {
-                Copy-Item $exeFound.FullName $WatsonBin -Force
-                $WatsonCmd = $WatsonBin
-                $sz = [math]::Round((Get-Item $WatsonBin).Length / 1KB)
-                Write-Info "  Watson v${watsonVer} extraído OK ($sz KB)"
-            } else {
-                Write-Warn "  Watson: Watson.exe não encontrado no archive (só source code)"
-                Write-Warn "  Watson: compilação necessária — CVEs inline na fase 11 cobrem os casos principais"
-            }
+        if (Safe-Download -Url $watsonGhostUrl -Dest $WatsonBin -MinBytes 10000) {
+            $WatsonCmd = $WatsonBin
+            $sz = [math]::Round((Get-Item $WatsonBin).Length / 1KB)
+            Write-Info "  Watson v${watsonVer} OK ($sz KB)"
         } else {
             Write-Warn "  Watson: download falhou"
             Write-Warn "  Manual: $watsonUrl → extrair Watson.exe → $WatsonBin"
@@ -812,7 +804,7 @@ if ($Quick) {
         $hklm = Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Name "AlwaysInstallElevated" -ErrorAction SilentlyContinue
         if ($hkcu.AlwaysInstallElevated -eq 1 -and $hklm.AlwaysInstallElevated -eq 1) { "CRÍTICO: AlwaysInstallElevated activo — CVE-2021-34527, CWE-269" }
         else { "OK: AlwaysInstallElevated não activo" }
-        ""; "=== Unquoted Service Paths ==="; Get-WmiObject -Class Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.PathName -match " " -and $_.PathName -notmatch '^"' } | ForEach-Object { "CRÍTICO: Unquoted path: $($_.Name) — $($_.PathName) — CWE-428" }
+        ""; "=== Unquoted Service Paths ==="; Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.PathName -match " " -and $_.PathName -notmatch '^"' } | ForEach-Object { "CRÍTICO: Unquoted path: $($_.Name) — $($_.PathName) — CWE-428" }
         ""; "=== Scheduled Tasks ==="; Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskPath -notlike "\Microsoft\*" } | Format-Table TaskName,TaskPath,State -AutoSize | Out-String
         ""; "=== AutoRun ==="; foreach ($p in @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run","HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run")) { "--- $p ---"; Get-ItemProperty -Path $p -ErrorAction SilentlyContinue | Out-String }
     }
@@ -894,7 +886,7 @@ if (Test-Path $PrivescCheck) {
 } else {
     Run-Scan "06_services_manual" "$Out\06_privesc.txt" {
         "=== SERVIÇOS ==="; Get-Service | Format-Table Name,DisplayName,Status,StartType | Out-String
-        ""; "=== UNQUOTED PATHS ==="; Get-WmiObject -Class Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.PathName -match " " -and $_.PathName -notmatch '^"' } | ForEach-Object { "CRÍTICO: $($_.Name) | $($_.PathName) — CWE-428" }
+        ""; "=== UNQUOTED PATHS ==="; Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.PathName -match " " -and $_.PathName -notmatch '^"' } | ForEach-Object { "CRÍTICO: $($_.Name) | $($_.PathName) — CWE-428" }
         ""; "=== SCHEDULED TASKS NÃO-MICROSOFT ==="; Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskPath -notlike "\Microsoft\*" -and $_.State -ne "Disabled" } | Format-Table TaskName,TaskPath,State -AutoSize | Out-String
     }
 }
@@ -924,7 +916,7 @@ if ($NoNvd) {
     $nvdOut = [System.Collections.Generic.List[string]]::new()
     $nvdOut.Add("=== NVD API CVE/CWE LOOKUP ==="); $nvdOut.Add("Data: $(Get-Date)"); $nvdOut.Add("")
     $components = [ordered]@{}
-    $osInfo2 = Get-WmiObject Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $osInfo2 = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
     if ($osInfo2.Version) { $components["windows"] = $osInfo2.Version }
     $iisV = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\InetStp" -ErrorAction SilentlyContinue).VersionString
     if ($iisV) { $components["iis"] = $iisV }
@@ -998,10 +990,10 @@ Run-Scan "09_registry" "$Out\09_registry.txt" {
 Run-Scan "10_services" "$Out\10_services.txt" {
     "=== SERVIÇOS — ANÁLISE DE SEGURANÇA ==="; ""
     "--- Unquoted Paths ---"
-    $unq = Get-WmiObject -Class Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.PathName -match " " -and $_.PathName -notmatch '^"' -and $_.PathName -notmatch "^C:\\Windows" }
+    $unq = Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.PathName -match " " -and $_.PathName -notmatch '^"' -and $_.PathName -notmatch "^C:\\Windows" }
     if ($unq) { foreach ($s in $unq) { "  CRÍTICO: $($s.Name) | $($s.StartMode) | $($s.PathName) — CWE-428" } } else { "  OK: Sem unquoted paths" }
     ""; "--- DLL Hijack Potencial ---"
-    Get-WmiObject -Class Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.PathName -like "*.exe*" -and $_.State -eq "Running" } | ForEach-Object {
+    Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.PathName -like "*.exe*" -and $_.State -eq "Running" } | ForEach-Object {
         $exePath = $_.PathName -replace '"','' -replace ' .*',''; $dir = Split-Path $exePath -Parent -ErrorAction SilentlyContinue
         if ($dir -and (Test-Path $dir)) {
             $acl = Get-Acl $dir -ErrorAction SilentlyContinue
@@ -1024,7 +1016,7 @@ Run-Scan "10_services" "$Out\10_services.txt" {
 Write-Sec "11 — Patch Gap Analysis"
 $patchOut = [System.Collections.Generic.List[string]]::new()
 $patchOut.Add("=== PATCH GAP ANALYSIS ==="); $patchOut.Add("Data: $(Get-Date)"); $patchOut.Add("")
-$osInfo3   = Get-WmiObject Win32_OperatingSystem -ErrorAction SilentlyContinue
+$osInfo3   = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
 $osBuild   = $osInfo3.BuildNumber; $osVer3 = $osInfo3.Version; $osName3 = $osInfo3.Caption
 
 # Camada A — WES-NG
@@ -1053,11 +1045,14 @@ if (-not $pythonCmd) {
 # Camada B — MSRC API
 $patchOut.Add(""); $patchOut.Add("══ CAMADA B — MSRC API ══"); $patchOut.Add("")
 $msrcProduct = switch -Regex ($osVer3) {
-    "^10\.0\.26"  { "Windows 11 Version 24H2" }
-    "^10\.0\.225" { "Windows 11 Version 23H2" }
-    "^10\.0\.222" { "Windows 11 Version 22H2" }
-    "^10\.0\.190" { "Windows 10 Version 22H2" }
-    default       { "Windows 10" }
+    "^10\.0\.262"  { "Windows 11 Version 25H2" }
+    "^10\.0\.261"  { "Windows 11 Version 24H2" }
+    "^10\.0\.226"  { "Windows 11 Version 23H2" }
+    "^10\.0\.222"  { "Windows 11 Version 22H2" }
+    "^10\.0\.190"  { "Windows 10 Version 22H2" }
+    "^10\.0\.189"  { "Windows 10 Version 21H2" }
+    "^10\.0\.0\.(17763|17134|16299)" { "Windows 10" }
+    default        { "Windows 10" }
 }
 $patchOut.Add("Produto: $msrcProduct (build $osBuild)")
 try {
@@ -1507,8 +1502,8 @@ try {
             tool = @{
                 driver = @{
                     name    = "windows-full-audit"
-                    version = "1.0"
-                    informationUri = "https://github.com/user/security-audit-scripts"
+                    version = "2.0"
+                    informationUri = "https://github.com/REstorninho/local-vulnerabilities-check"
                     rules = @($rulesDict.Values)
                 }
             }

@@ -865,7 +865,9 @@ if (Test-Path $PrivescCheck) {
             # Suprimir warnings do PS dentro do job
             $WarningPreference = "SilentlyContinue"
             Import-Module $pc -Force -ErrorAction Stop -WarningAction SilentlyContinue
-            Invoke-PrivescCheck -Extended -Force -Risky -Report $outBase -Format TXT,HTML,CSV 2>&1
+            $pcFlags = @("-Extended","-Audit","-Force","-Risky")
+            if ($using:DeepScan) { $pcFlags += "-Experimental" }
+            Invoke-PrivescCheck @pcFlags -Report $outBase -Format TXT,HTML,CSV,XML 2>&1
         } -ArgumentList $PrivescCheck,"$Out\06_privesc",$runAsAdmin
         Wait-Job $pcJob -Timeout 300 | Out-Null
         $jobOut = Receive-Job $pcJob -WarningAction SilentlyContinue
@@ -897,7 +899,45 @@ if (Test-Path $PrivescCheck) {
         "Erro: $($_.Exception.Message)" | Out-File "$Out\06_privesc.txt" -Encoding UTF8
         Write-Warn "06_privesc ERRO: $($_.Exception.Message)"
     }
+
+    # ── Parsear CSV do PrivescCheck → $PrivescFindings ────────────────
+    $PrivescFindings = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $privescCsv = "$Out\06_privesc.csv"
+    if (Test-Path $privescCsv) {
+        $privescCweMap = @{
+            "SERVICES"    = "CWE-732"   # Weak service ACL / unquoted path
+            "PROGRAMS"    = "CWE-428"   # Unquoted binary path
+            "TASKS"       = "CWE-284"   # Writable scheduled task action
+            "CREDENTIALS" = "CWE-256"   # Cleartext credential storage
+            "HARDENING"   = "CWE-16"    # Security misconfiguration
+            "USER"        = "CWE-269"   # Improper privilege management
+            "REGISTRY"    = "CWE-732"   # Weak registry ACL
+            "NETWORK"     = "CWE-284"   # Network misconfiguration
+            "APPS"        = "CWE-1104"  # Unmanaged / outdated component
+            "COM"         = "CWE-427"   # DLL search order hijacking
+            "UPDATES"     = "CWE-1104"  # Missing security patches
+            "MISC"        = "CWE-16"    # Miscellaneous misconfiguration
+        }
+        try {
+            $pcRows = Import-Csv $privescCsv -ErrorAction Stop
+            foreach ($row in $pcRows) {
+                $sev = ($row.Severity ?? "").Trim().ToUpper()
+                if ($sev -notin @("HIGH","MEDIUM","CRITICAL")) { continue }
+                $cat = ($row.Category ?? "").Trim().ToUpper()
+                $cwe = ""; foreach ($k in $privescCweMap.Keys) { if ($cat -like "*$k*") { $cwe = $privescCweMap[$k]; break } }
+                $PrivescFindings.Add([PSCustomObject]@{
+                    Category    = $row.Category
+                    Name        = $row.DisplayName
+                    Description = $row.Description
+                    Severity    = $sev
+                    Cwe         = $cwe
+                })
+            }
+            Write-Info "PrivescCheck CSV: $($PrivescFindings.Count) findings (High/Medium)"
+        } catch { Write-Warn "PrivescCheck CSV parse: $($_.Exception.Message)" }
+    }
 } else {
+    $PrivescFindings = [System.Collections.Generic.List[PSCustomObject]]::new()
     Run-Scan "06_services_manual" "$Out\06_privesc.txt" {
         "=== SERVIÇOS ==="; Get-Service | Format-Table Name,DisplayName,Status,StartType | Out-String
         ""; "=== UNQUOTED PATHS ==="; Get-WmiObject -Class Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.PathName -match " " -and $_.PathName -notmatch '^"' } | ForEach-Object { "CRÍTICO: $($_.Name) | $($_.PathName) — CWE-428" }
@@ -1455,8 +1495,19 @@ if (-not $NoNvd) {
     }
 }
 
+# Injectar findings do PrivescCheck no CveResults para SARIF/CSV/Dashboard
+foreach ($pf in $PrivescFindings) {
+    $desc = if ($pf.Description) { if ($pf.Description.Length -gt 200) { $pf.Description.Substring(0,200)+"…" } else { $pf.Description } } else { $pf.Name }
+    $CveResults.Add([PSCustomObject]@{
+        Source="PrivescCheck"; App=$pf.Category; Version=""; FixedIn=""
+        CveId=""; Severity=$pf.Severity; Cvss=$null
+        Title=$pf.Name; Description=$desc
+        Cwe=$pf.Cwe; References="https://github.com/itm4n/PrivescCheck"
+    })
+}
+
 $CveResults | ConvertTo-Json -Depth 5 | Out-File $CveFile -Encoding UTF8
-Write-Info "CVEs: $($CveResults.Count) total → $CveFile"
+Write-Info "CVEs: $($CveResults.Count) total ($($PrivescFindings.Count) PrivescCheck) → $CveFile"
 
 # ═══════════════════════════════════════════════════════════════════
 # FASE 4.5 — EXPORTS (CSV + SARIF) e COMPARAÇÃO (#1 + #3)
@@ -1478,26 +1529,30 @@ try {
     $rulesDict = @{}
     $sarifResults = [System.Collections.Generic.List[object]]::new()
     foreach ($cve in $CveResults) {
-        if (-not $cve.CveId) { continue }
-        if (-not $rulesDict.ContainsKey($cve.CveId)) {
-            $rulesDict[$cve.CveId] = @{
-                id    = $cve.CveId
-                name  = $cve.CveId
-                shortDescription = @{ text = if ($cve.Title) { $cve.Title.Substring(0,[Math]::Min(120,$cve.Title.Length)) } else { $cve.CveId } }
-                fullDescription  = @{ text = if ($cve.Description) { $cve.Description.Substring(0,[Math]::Min(500,$cve.Description.Length)) } else { $cve.CveId } }
-                helpUri = "https://nvd.nist.gov/vuln/detail/$($cve.CveId)"
+        # Findings do PrivescCheck usam ID sintético baseado no nome (sem CVE ID)
+        $ruleId = if ($cve.CveId) { $cve.CveId } `
+                  elseif ($cve.Source -eq "PrivescCheck") { "PRIVESC-" + ($cve.Title -replace '[^A-Za-z0-9]','-').ToUpper().TrimEnd('-') } `
+                  else { continue }
+        if (-not $rulesDict.ContainsKey($ruleId)) {
+            $isPrivesc = ($cve.Source -eq "PrivescCheck")
+            $rulesDict[$ruleId] = @{
+                id    = $ruleId
+                name  = $ruleId
+                shortDescription = @{ text = if ($cve.Title) { $cve.Title.Substring(0,[Math]::Min(120,$cve.Title.Length)) } else { $ruleId } }
+                fullDescription  = @{ text = if ($cve.Description) { $cve.Description.Substring(0,[Math]::Min(500,$cve.Description.Length)) } else { $ruleId } }
+                helpUri = if ($isPrivesc) { "https://github.com/itm4n/PrivescCheck" } else { "https://nvd.nist.gov/vuln/detail/$ruleId" }
                 properties = @{
-                    tags = @("security","cve")
-                    "security-severity" = if ($cve.Cvss) { [string]$cve.Cvss } else { "0" }
+                    tags = if ($isPrivesc) { @("security","privesc","windows") } else { @("security","cve") }
+                    "security-severity" = if ($cve.Cvss) { [string]$cve.Cvss } else { if (($cve.Severity ?? "") -eq "HIGH") { "7.5" } else { "0" } }
                 }
             }
         }
         $sev = if ($cve.Severity) { $cve.Severity.ToUpper() } else { "UNKNOWN" }
         $level = if ($sevMap.ContainsKey($sev)) { $sevMap[$sev] } else { "none" }
-        $msg = "$($cve.App) $($cve.Version) → $($cve.CveId) ($sev)"
+        $msg = if ($cve.CveId) { "$($cve.App) $($cve.Version) → $($cve.CveId) ($sev)" } else { "$($cve.App) → $($cve.Title) ($sev)" }
         if ($cve.FixedIn) { $msg += " — fixed in $($cve.FixedIn)" }
         $sarifResults.Add(@{
-            ruleId  = $cve.CveId
+            ruleId  = $ruleId
             level   = $level
             message = @{ text = $msg }
             locations = @(@{ physicalLocation = @{ artifactLocation = @{ uri = if ($cve.App) { $cve.App } else { "unknown" } } } })
@@ -1743,13 +1798,18 @@ $catFiles = @{}; foreach ($cat in $tocOrder) { $catFiles[$cat] = @() }
 foreach ($f in $txtFiles) { $cat = Get-Category -base $f.BaseName; $catFiles[$cat] += $f }
 
 # ── JSON para o CVE Dashboard ──────────────────────────────────────
-$CveJson  = $CveResults | Select-Object Source,App,Version,FixedIn,CveId,Severity,Cvss,Title,Description,Cwe,References | ConvertTo-Json -Depth 5 -Compress
-$InvJson  = $Inventory  | Select-Object Key,Name,Version,Publisher,Category | ConvertTo-Json -Depth 3 -Compress
-$UpdJson  = $AppUpdates | Select-Object Source,Name,WingetId,Current,Available,UpdateCmd | ConvertTo-Json -Depth 3 -Compress
+$CveJson     = $CveResults     | Select-Object Source,App,Version,FixedIn,CveId,Severity,Cvss,Title,Description,Cwe,References | ConvertTo-Json -Depth 5 -Compress
+$InvJson     = $Inventory      | Select-Object Key,Name,Version,Publisher,Category | ConvertTo-Json -Depth 3 -Compress
+$UpdJson     = $AppUpdates     | Select-Object Source,Name,WingetId,Current,Available,UpdateCmd | ConvertTo-Json -Depth 3 -Compress
+$PrivescJson = $PrivescFindings | Select-Object Category,Name,Description,Severity,Cwe | ConvertTo-Json -Depth 3 -Compress
+if (-not $PrivescJson -or $PrivescJson -eq 'null') { $PrivescJson = '[]' }
 # Escapar </script> para evitar quebra de parsing HTML quando CVE data contém essa string
-$CveJson = $CveJson -replace '</script>', '<\/script>'
-$InvJson = $InvJson -replace '</script>', '<\/script>'
-$UpdJson = $UpdJson -replace '</script>', '<\/script>'
+$CveJson     = $CveJson     -replace '</script>', '<\/script>'
+$InvJson     = $InvJson     -replace '</script>', '<\/script>'
+$UpdJson     = $UpdJson     -replace '</script>', '<\/script>'
+$PrivescJson = $PrivescJson -replace '</script>', '<\/script>'
+$PrivescCrit = ($PrivescFindings | Where-Object { $_.Severity -eq "CRITICAL" }).Count
+$PrivescHigh = ($PrivescFindings | Where-Object { $_.Severity -eq "HIGH" }).Count
 
 # ── OS Info ───────────────────────────────────────────────────────
 $winBuild = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
@@ -1916,6 +1976,7 @@ foreach ($cat in $tocOrder) {
     <div class="toc-item active" onclick="showDash('summary',this)">&#128202; Dashboard</div>
     <div class="toc-cat">Vulnerabilidades</div>
     <div class="toc-item" onclick="showDash('cve',this)">&#128308; CVEs / CWEs <span class="toc-mini tm-c">$($CveResults.Count)</span></div>
+    <div class="toc-item" onclick="showDash('privesc',this)">&#128274; Privesc Findings <span class="toc-mini tm-h">$($PrivescFindings.Count)</span></div>
     <div class="toc-cat">Updates</div>
     <div class="toc-item" onclick="showDash('upd',this)">&#128230; App Updates <span class="toc-mini $(if($AppUpdates.Count -gt 0){"tm-h"}else{"tm-o"})">$($AppUpdates.Count)</span></div>
     <div class="toc-cat">Inventário</div>
@@ -2062,6 +2123,7 @@ foreach ($cat in $tocOrder) {
   <div class="dash-card"><div class="num" style="color:var(--green)">$CweUniq</div><div class="lbl">CWEs Únicos</div></div>
   <div class="dash-card"><div class="num" style="color:var(--cyan)">$($AppUpdates.Count)</div><div class="lbl">App Updates</div></div>
   <div class="dash-card"><div class="num" style="color:var(--text)">$($CveResults.Count)</div><div class="lbl">CVEs Total</div></div>
+  <div class="dash-card"><div class="num" style="color:var(--magenta)">$($PrivescFindings.Count)</div><div class="lbl">Privesc Findings</div></div>
   <div class="dash-card"><div class="num" style="color:var(--text)">$($Inventory.Count)</div><div class="lbl">Apps Detectadas</div></div>
 </div>
 <div class="section2"><div class="sec2-hdr" onclick="toggleS2('top-apps')"><span class="sec2-title">&#127942; Apps com mais CVEs</span><span style="color:var(--dim)">&#9660;</span></div><div class="sec2-body open" id="top-apps-body"><div id="top-apps-content"></div></div></div>
@@ -2078,6 +2140,10 @@ foreach ($cat in $tocOrder) {
   <input class="search-box" id="inv-search" placeholder="&#128269; Filtrar apps..." oninput="renderInv()">
   <div id="inv-grid-wrap"></div>
 </div>
+<div id="dash-privesc" style="display:none">
+  <input class="search-box" id="privesc-search" placeholder="&#128269; Filtrar categoria, finding, CWE..." oninput="renderPrivesc()">
+  <div id="privesc-table-wrap"></div>
+</div>
 "@)
 [void]$sb.AppendLine('</div>') # end tab-dashboard
 
@@ -2090,6 +2156,7 @@ foreach ($cat in $tocOrder) {
 const DATA_CVE=$CveJson;
 const DATA_INV=$InvJson;
 const DATA_UPD=$UpdJson;
+const DATA_PRIVESC=$PrivescJson;
 let cveFilter='all';
 
 function switchTab(id,el){
@@ -2114,7 +2181,30 @@ function showDash(id,el){
   var s=document.getElementById('dash-'+id);if(s)s.style.display='block';
   document.querySelectorAll('#toc-dash .toc-item').forEach(i=>i.classList.remove('active'));
   if(el)el.classList.add('active');
-  if(id==='cve')renderCves();if(id==='inv')renderInv();if(id==='upd')renderUpd();if(id==='summary')renderSummary();
+  if(id==='cve')renderCves();if(id==='inv')renderInv();if(id==='upd')renderUpd();if(id==='summary')renderSummary();if(id==='privesc')renderPrivesc();
+}
+function renderPrivesc(){
+  var q=(document.getElementById('privesc-search')?.value||'').toLowerCase();
+  var rows=DATA_PRIVESC||[];
+  if(q)rows=rows.filter(r=>(r.Category||'').toLowerCase().includes(q)||(r.Name||'').toLowerCase().includes(q)||(r.Cwe||'').toLowerCase().includes(q)||(r.Description||'').toLowerCase().includes(q));
+  var ord={CRITICAL:0,HIGH:1,MEDIUM:2,LOW:3};
+  rows=rows.slice().sort((a,b)=>(ord[(a.Severity||'').toUpperCase()]??9)-(ord[(b.Severity||'').toUpperCase()]??9));
+  if(!rows.length){document.getElementById('privesc-table-wrap').innerHTML='<p style="color:var(--green);margin:12px 0">&#10003; Sem findings de privesc de alta/média severidade</p>';return;}
+  var h='<p style="color:var(--dim);font-size:.79em;margin-bottom:8px">'+rows.length+' findings</p>';
+  h+='<table class="vtable"><thead><tr><th>Sev</th><th>Categoria</th><th>Finding</th><th>CWE</th><th>Descrição</th></tr></thead><tbody>';
+  rows.forEach(function(r){
+    var cweN=r.Cwe?r.Cwe.replace('CWE-',''):'';
+    var cweS=r.Cwe?'<a class="cwe-id" href="https://cwe.mitre.org/data/definitions/'+cweN+'.html" target="_blank" style="text-decoration:none">'+r.Cwe+' &#8599;</a>':'&#8211;';
+    var desc=(r.Description||'').substring(0,160);
+    h+='<tr>'+
+       '<td>'+sevBadge(r.Severity)+'</td>'+
+       '<td style="color:var(--cyan);font-size:.82em">'+(r.Category||'')+'</td>'+
+       '<td><b style="font-size:.83em">'+(r.Name||'')+'</b></td>'+
+       '<td>'+cweS+'</td>'+
+       '<td style="font-size:.79em;color:var(--dim)">'+desc+'</td></tr>';
+  });
+  h+='</tbody></table>';
+  document.getElementById('privesc-table-wrap').innerHTML=h;
 }
 function sevBadge(s){
   var sn=(s||'UNKNOWN').toUpperCase();
